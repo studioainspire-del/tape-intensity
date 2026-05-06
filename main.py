@@ -1,0 +1,1 @@
+print("tape-intensity project initialized")
