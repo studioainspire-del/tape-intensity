@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Project-specific
+test_real.py
+sample_data/glbx-mdp3-*.csv
