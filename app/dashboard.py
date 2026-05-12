@@ -1,39 +1,30 @@
 """
-Phase 4: Dash dashboard for the tape intensity indicator.
+Phase 5: Dash dashboard for the tape intensity indicator.
 
-Architecture:
-    - Main thread: Dash/Flask server. Handles HTTP requests and runs
-      the layout/callback machinery.
-    - Background thread: a dedicated asyncio event loop that owns the
-      adapter and runs the processor's consume() task.
-    - Shared state: a single IntensityProcessor instance, written by
-      the consume task (in the background thread) and read by the Dash
-      callback (in the main thread). Reads and writes are individually
-      atomic at the bytecode level (Python GIL + deque semantics), so
-      no explicit lock is needed for this design.
+Now driven by per-instrument config (config/instruments.py) and
+command-line arguments. Run with --help to see options.
 
-What the user sees:
-    A three-line scrolling chart of the most recent 3 minutes:
-        - Green: buy intensity (contracts/sec)
-        - Red: sell intensity (contracts/sec)
-        - White: price (secondary right-side Y-axis)
-    Plus a small text panel showing current state and the data-feed
-    health indicator.
+Examples:
+    python -m app.dashboard
+    python -m app.dashboard MNQ
+    python -m app.dashboard MNQ --csv sample_data/glbx-mdp3-20260410.trades.csv
+    python -m app.dashboard MGC --csv data/gold_april10.csv --speed 5.0
 
-Update cadence:
-    Browser polls every 200ms via dcc.Interval (5 Hz). Each poll
-    triggers update_chart(), which appends a new ProcessorState sample
-    to a bounded history buffer and rebuilds the figure from it.
+Architecture (unchanged from Phase 4):
+    Main thread: Dash/Flask server.
+    Background thread: asyncio loop, owns the adapter + consume task.
+    Shared state: the IntensityProcessor singleton.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import threading
 import time as _time
 from collections import deque
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -44,6 +35,7 @@ from plotly.subplots import make_subplots
 
 from adapters.csv_adapter import CSVAdapter
 from adapters.replay_adapter import ReplayAdapter
+from config import instruments as instrument_config
 from processor.intensity import IntensityProcessor, ProcessorState
 
 
@@ -54,65 +46,57 @@ logger = logging.getLogger(__name__)
 # Display configuration
 # ---------------------------------------------------------------------------
 
-# Visible time window for the rolling chart (seconds).
-VISIBLE_WINDOW_SECONDS = 180  # 3 minutes
+VISIBLE_WINDOW_SECONDS = 180   # 3-minute rolling view
+POLL_INTERVAL_MS = 200         # 5 Hz refresh
+HISTORY_MAX = 1200             # snapshots retained (5 Hz * 240s buffer)
 
-# Dashboard polling rate (milliseconds). 200ms = 5 Hz.
-POLL_INTERVAL_MS = 200
-
-# Cap on the history buffer of ProcessorState snapshots. At 5 Hz over
-# 3 minutes that's 900; we keep a little extra headroom.
-HISTORY_MAX = 1200
-
-# Display timezone for the X-axis ticks.
-DISPLAY_TZ = ZoneInfo("America/Chicago")
-
-# Color discipline (your spec).
-COLOR_BUY = "#00d68f"     # green
-COLOR_SELL = "#ff5b5b"    # red
-COLOR_PRICE = "#ffffff"   # white
-COLOR_NET = "#ffcc00"     # yellow (net delta = buy - sell)
-COLOR_BG = "#111111"      # near-black chart background
-COLOR_FG = "#cccccc"      # light gray text/axis
+COLOR_BUY = "#00d68f"
+COLOR_SELL = "#ff5b5b"
+COLOR_PRICE = "#ffffff"
+COLOR_NET = "#ffcc00"
+COLOR_BG = "#111111"
+COLOR_FG = "#cccccc"
 
 
 # ---------------------------------------------------------------------------
-# Shared state: the processor + a rolling snapshot history
+# Runtime state (populated by main() before the server starts)
 # ---------------------------------------------------------------------------
 
-# Module-level singletons. Threading note: these objects are created
-# once at process start, before the background thread is spawned and
-# before the Dash server begins serving requests. So there's no race
-# between construction and access.
-processor = IntensityProcessor(window_seconds=10.0)
-history: deque[ProcessorState] = deque(maxlen=HISTORY_MAX)
+# These are set in main() once we have parsed args + loaded the instrument
+# config. They're module-level so the Dash callback can see them.
+processor: IntensityProcessor
+history: deque[ProcessorState]
+display_tz: ZoneInfo
+display_name: str
+symbol: str
+price_decimals: int
 
-# Staleness tracking for the health light. Anchored to wall-clock,
-# not tick-time, because the question is "is the data pipeline alive?"
-# We remember the last tick timestamp we observed, and the wall-clock
-# time at which we first observed it. As long as new tick timestamps
-# keep arriving, the staleness counter stays near zero.
+# Staleness tracking for the health light.
 _last_seen_tick_ts: Optional[datetime] = None
 _last_seen_wall: float = 0.0
 
 
 # ---------------------------------------------------------------------------
-# Background thread: asyncio event loop running the consume task
+# Background pipeline thread
 # ---------------------------------------------------------------------------
 
-def run_data_pipeline(csv_path: Path) -> None:
-    """Run the adapter -> processor pipeline forever in this thread.
-
-    This function blocks. Run it as the target of a daemon thread.
-    """
+def run_data_pipeline(
+    csv_path: Path,
+    symbol_filter: str,
+    speed: float,
+    session_start,
+    session_end,
+    session_timezone: str,
+) -> None:
+    """Run the adapter -> processor pipeline forever in this thread."""
     async def _pipeline():
-        inner = CSVAdapter(csv_path, symbol_filter="MNQM6")
+        inner = CSVAdapter(csv_path, symbol_filter=symbol_filter)
         adapter = ReplayAdapter(
             inner,
-            speed=1.0,  # real-time for the dashboard view
-            session_start=dt_time(8, 30),
-            session_end=dt_time(15, 0),
-            session_timezone="America/Chicago",
+            speed=speed,
+            session_start=session_start,
+            session_end=session_end,
+            session_timezone=session_timezone,
         )
         await adapter.connect()
         try:
@@ -124,55 +108,67 @@ def run_data_pipeline(csv_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dash app
+# Dash app — layout built once, after main() configures globals
 # ---------------------------------------------------------------------------
 
 app = Dash(__name__)
-app.title = "Tape Intensity"
 
-app.layout = html.Div(
-    style={
-        "backgroundColor": COLOR_BG,
-        "color": COLOR_FG,
-        "fontFamily": "monospace",
-        "padding": "12px",
-        "minHeight": "100vh",
-    },
-    children=[
-        html.Div(
-            style={"display": "flex", "justifyContent": "space-between",
-                   "alignItems": "center", "marginBottom": "8px"},
-            children=[
-                html.H2("Tape Intensity (MNQM6)", style={"margin": 0}),
-                html.Div(id="status-bar", style={"fontSize": "14px"}),
-            ],
-        ),
-        html.Div(
-            style={"marginBottom": "4px"},
-            children=[
-                dcc.Checklist(
-                    id="line-toggles",
-                    options=[
-                        {"label": " net delta (buy - sell)", "value": "net"},
-                    ],
-                    value=["net"],
-                    style={"color": COLOR_FG, "fontSize": "13px"},
-                    inputStyle={"marginRight": "6px"},
-                ),
-            ],
-        ),
-        dcc.Graph(
-            id="intensity-chart",
-            style={"height": "70vh"},
-            config={"displayModeBar": False},
-        ),
-        dcc.Interval(id="tick", interval=POLL_INTERVAL_MS, n_intervals=0),
-    ],
-)
+
+def _build_layout() -> html.Div:
+    """Construct the page layout. Called from main() after globals are set."""
+    return html.Div(
+        style={
+            "backgroundColor": COLOR_BG,
+            "color": COLOR_FG,
+            "fontFamily": "monospace",
+            "padding": "12px",
+            "minHeight": "100vh",
+        },
+        children=[
+            html.Div(
+                style={"display": "flex", "justifyContent": "space-between",
+                       "alignItems": "center", "marginBottom": "8px"},
+                children=[
+                    html.H2(f"Tape Intensity ({display_name} {symbol})",
+                            style={"margin": 0}),
+                    html.Div(id="status-bar", style={"fontSize": "14px"}),
+                ],
+            ),
+            html.Div(
+                style={"marginBottom": "4px"},
+                children=[
+                    dcc.Checklist(
+                        id="line-toggles",
+                        options=[
+                            {"label": " buy", "value": "buy"},
+                            {"label": " sell", "value": "sell"},
+                            {"label": " net delta", "value": "net"},
+                            {"label": " price", "value": "price"},
+                        ],
+                        value=["buy", "sell", "net", "price"],
+                        style={"color": COLOR_FG, "fontSize": "13px",
+                               "display": "flex", "gap": "16px"},
+                        inputStyle={"marginRight": "6px"},
+                    ),
+                ],
+            ),
+            dcc.Graph(
+                id="intensity-chart",
+                style={"height": "70vh"},
+                config={
+                    # Drag to pan, scroll wheel to zoom, double-click to autoscale.
+                    # Hides the modebar entirely since we don't need its other tools.
+                    "displayModeBar": False,
+                    "scrollZoom": True,
+                    "doubleClick": "autosize",
+                },
+            ),
+            dcc.Interval(id="tick", interval=POLL_INTERVAL_MS, n_intervals=0),
+        ],
+    )
 
 
 def _health_from_age(age_seconds: float) -> tuple[str, str]:
-    """Return (color_hex, label) for the connection health indicator."""
     if age_seconds < 1.0:
         return ("#00d68f", "GREEN")
     if age_seconds < 5.0:
@@ -187,30 +183,27 @@ def _health_from_age(age_seconds: float) -> tuple[str, str]:
     Input("line-toggles", "value"),
 )
 def update_chart(_n: int, toggles: list[str]):
-    """Called every POLL_INTERVAL_MS. Pulls a state snapshot, redraws."""
     global _last_seen_tick_ts, _last_seen_wall
+
+    toggles = toggles or []
+    show_buy = "buy" in toggles
+    show_sell = "sell" in toggles
+    show_net = "net" in toggles
+    show_price = "price" in toggles
 
     state = processor.get_state()
     history.append(state)
 
-    # Staleness tracking. If the consume task pushed a new tick since
-    # the last poll, the latest state's timestamp will have advanced.
-    # If it hasn't, this state is stale and the wall-clock counter
-    # measures exactly how long it's been stale.
+    # Staleness tracking, wall-clock anchored.
     now_wall = _time.monotonic()
     if _last_seen_tick_ts is None or state.timestamp != _last_seen_tick_ts:
         _last_seen_tick_ts = state.timestamp
         _last_seen_wall = now_wall
     staleness_seconds = now_wall - _last_seen_wall
 
-    # Trim history to the visible window. We keep this cheap: just
-    # build lists from the deque and filter by timestamp.
     if not history:
         return _empty_figure(), "no data"
 
-    # X-axis is tick-time, not wall-clock time. During replay this
-    # makes the chart move forward at the replay speed; during live
-    # they coincide.
     latest_tick_ts = history[-1].timestamp
     window_start = latest_tick_ts.timestamp() - VISIBLE_WINDOW_SECONDS
 
@@ -223,52 +216,46 @@ def update_chart(_n: int, toggles: list[str]):
     for s in history:
         if s.timestamp.timestamp() < window_start:
             continue
-        xs.append(s.timestamp.astimezone(DISPLAY_TZ))
+        xs.append(s.timestamp.astimezone(display_tz))
         buys.append(s.buy_rate)
         sells.append(s.sell_rate)
         nets.append(s.net_rate)
         prices.append(s.last_price)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(
-        go.Scatter(x=xs, y=buys, name="Buy intensity",
-                   line=dict(color=COLOR_BUY, width=2),
-                   hovertemplate="%{y:.1f} contracts/s<extra>buy</extra>"),
-        secondary_y=False,
-    )
-    fig.add_trace(
-        go.Scatter(x=xs, y=sells, name="Sell intensity",
-                   line=dict(color=COLOR_SELL, width=2),
-                   hovertemplate="%{y:.1f} contracts/s<extra>sell</extra>"),
-        secondary_y=False,
-    )
-    if "net" in (toggles or []):
+
+    if show_buy:
         fig.add_trace(
-            go.Scatter(x=xs, y=nets, name="Net delta",
-                       line=dict(color=COLOR_NET, width=1.5, dash="dot"),
-                       hovertemplate="%{y:+.1f} contracts/s<extra>net</extra>"),
+            go.Scatter(x=xs, y=buys, name="Buy",
+                       line=dict(color=COLOR_BUY, width=2),
+                       hovertemplate="%{y:.1f} c/s<extra>buy</extra>"),
             secondary_y=False,
         )
-    fig.add_trace(
-        go.Scatter(x=xs, y=prices, name="Price",
-                   line=dict(color=COLOR_PRICE, width=1.5),
-                   hovertemplate="%{y:.2f}<extra>price</extra>"),
-        secondary_y=True,
-    )
+    if show_sell:
+        fig.add_trace(
+            go.Scatter(x=xs, y=sells, name="Sell",
+                       line=dict(color=COLOR_SELL, width=2),
+                       hovertemplate="%{y:.1f} c/s<extra>sell</extra>"),
+            secondary_y=False,
+        )
+    if show_net:
+        fig.add_trace(
+            go.Scatter(x=xs, y=nets, name="Net",
+                       line=dict(color=COLOR_NET, width=1.5, dash="dot"),
+                       hovertemplate="%{y:+.1f} c/s<extra>net</extra>"),
+            secondary_y=False,
+        )
+    if show_price:
+        fig.add_trace(
+            go.Scatter(x=xs, y=prices, name="Price",
+                       line=dict(color=COLOR_PRICE, width=1.5),
+                       hovertemplate=f"%{{y:.{price_decimals}f}}<extra>price</extra>"),
+            secondary_y=True,
+        )
 
-    # Tight auto-scale on price (right axis): use the visible-window
-    # min/max with a small pad. Plotly's default auto-scale tends to
-    # over-pad, so we set the range explicitly.
-    if prices:
-        p_min, p_max = min(prices), max(prices)
-        p_pad = max((p_max - p_min) * 0.1, 0.25)  # at least one NQ tick
-        fig.update_yaxes(range=[p_min - p_pad, p_max + p_pad],
-                         secondary_y=True, showgrid=False,
-                         color=COLOR_PRICE, title_text="")
-    # Left axis: must accommodate the net delta if it's visible, since
-    # net can go negative. Default rangemode=tozero hides negative space;
-    # we override based on the toggle.
-    if "net" in (toggles or []):
+    # Left axis (intensity). If net is visible, allow negative space;
+    # otherwise pin baseline at zero for a cleaner look.
+    if show_net:
         fig.update_yaxes(secondary_y=False,
                          color=COLOR_FG, title_text="contracts/sec",
                          gridcolor="#222222",
@@ -278,6 +265,19 @@ def update_chart(_n: int, toggles: list[str]):
         fig.update_yaxes(rangemode="tozero", secondary_y=False,
                          color=COLOR_FG, title_text="contracts/sec",
                          gridcolor="#222222")
+
+    # Right axis (price). Visible only when price toggle is on.
+    if show_price and prices:
+        p_min, p_max = min(prices), max(prices)
+        p_pad = max((p_max - p_min) * 0.1, 0.25)
+        fig.update_yaxes(range=[p_min - p_pad, p_max + p_pad],
+                         secondary_y=True, showgrid=False,
+                         color=COLOR_PRICE, title_text="",
+                         visible=True)
+    else:
+        # Hide the right axis entirely when price is off. This gives
+        # the intensity lines the full chart width.
+        fig.update_yaxes(secondary_y=True, visible=False)
 
     fig.update_layout(
         paper_bgcolor=COLOR_BG,
@@ -290,12 +290,19 @@ def update_chart(_n: int, toggles: list[str]):
                     xanchor="right", x=1.0,
                     bgcolor="rgba(0,0,0,0)"),
         hovermode="x unified",
-        uirevision="static",  # don't reset zoom/pan on refresh
+        # dragmode="pan" makes click-drag pan the chart instead of
+        # drawing a zoom box. Combined with scrollZoom in the Graph
+        # config and doubleClick="autosize", this gives a much more
+        # natural feel: drag to pan, scroll to zoom, double-click to
+        # reset.
+        dragmode="pan",
+        uirevision="static",
     )
 
-    # Status bar: health light, last-tick time, current rates.
+    # Status bar.
     health_color, health_label = _health_from_age(staleness_seconds)
-    last_tick_str = state.timestamp.astimezone(DISPLAY_TZ).strftime("%H:%M:%S")
+    last_tick_str = state.timestamp.astimezone(display_tz).strftime("%H:%M:%S")
+    price_str = f"{state.last_price:.{price_decimals}f}"
     status = html.Div(
         style={"display": "flex", "gap": "20px", "alignItems": "center"},
         children=[
@@ -312,7 +319,7 @@ def update_chart(_n: int, toggles: list[str]):
                       style={"color": COLOR_SELL}),
             html.Span(f"net {state.net_rate:>+5.1f}/s",
                       style={"color": COLOR_NET}),
-            html.Span(f"price {state.last_price:.2f}",
+            html.Span(f"price {price_str}",
                       style={"color": COLOR_PRICE}),
             html.Span(f"buf {state.tick_count_in_window}",
                       style={"color": "#888888"}),
@@ -322,7 +329,6 @@ def update_chart(_n: int, toggles: list[str]):
 
 
 def _empty_figure() -> go.Figure:
-    """Placeholder figure shown before any data arrives."""
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.update_layout(
         paper_bgcolor=COLOR_BG, plot_bgcolor=COLOR_BG,
@@ -330,6 +336,7 @@ def _empty_figure() -> go.Figure:
         margin=dict(l=50, r=50, t=20, b=40),
         xaxis=dict(color=COLOR_FG, gridcolor="#222222"),
         yaxis=dict(color=COLOR_FG, gridcolor="#222222"),
+        dragmode="pan",
         annotations=[dict(text="waiting for data...",
                           xref="paper", yref="paper",
                           x=0.5, y=0.5, showarrow=False,
@@ -342,31 +349,101 @@ def _empty_figure() -> go.Figure:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="python -m app.dashboard",
+        description="Tape intensity dashboard (Phase 5).",
+    )
+    p.add_argument(
+        "instrument",
+        nargs="?",
+        default="MNQ",
+        help="Instrument code from config/instruments.py "
+             "(MNQ, NQ, MGC, GC, ES, MES). Default: MNQ",
+    )
+    p.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help="Path to a Databento trades CSV. "
+             "Default: sample_data/glbx-mdp3-20260410.trades.csv",
+    )
+    p.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Replay speed multiplier (1.0 = real-time). Default: 1.0",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=8050,
+        help="HTTP port to serve on. Default: 8050",
+    )
+    return p.parse_args()
+
+
 def main():
+    global processor, history, display_tz, display_name, symbol, price_decimals
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    csv_path = Path(__file__).parent.parent / "sample_data" / "glbx-mdp3-20260410.trades.csv"
-    if not csv_path.exists():
-        # Fall back to the variant with underscore (e.g. testing env)
-        alt = csv_path.with_name("glbx-mdp3-20260410_trades.csv")
-        if alt.exists():
-            csv_path = alt
-        else:
-            raise FileNotFoundError(
-                f"Neither {csv_path} nor {alt} exists. "
-                "Put a Databento trades CSV in sample_data/."
-            )
+    args = _parse_args()
 
-    logger.info("Starting data pipeline thread (csv=%s)", csv_path)
-    t = threading.Thread(target=run_data_pipeline, args=(csv_path,), daemon=True)
+    try:
+        cfg = instrument_config.get(args.instrument)
+    except KeyError as e:
+        raise SystemExit(str(e))
+
+    # Resolve CSV path. Default lives in the project root's sample_data.
+    if args.csv is not None:
+        csv_path = args.csv
+    else:
+        csv_path = (Path(__file__).parent.parent / "sample_data"
+                    / "glbx-mdp3-20260410.trades.csv")
+
+    if not csv_path.exists():
+        raise SystemExit(f"CSV not found: {csv_path}")
+
+    # Initialize module globals that the callback reads.
+    processor = IntensityProcessor(window_seconds=cfg["smoothing_seconds"])
+    history = deque(maxlen=HISTORY_MAX)
+    display_tz = ZoneInfo(cfg["session_timezone"])
+    display_name = cfg["display_name"]
+    symbol = cfg["symbol"]
+    price_decimals = cfg["price_decimals"]
+
+    app.title = f"Tape Intensity {symbol}"
+    app.layout = _build_layout()
+
+    logger.info(
+        "Starting: instrument=%s symbol=%s smoothing=%ss "
+        "session=%s-%s %s speed=%sx csv=%s",
+        args.instrument, cfg["symbol"], cfg["smoothing_seconds"],
+        cfg["session_start"], cfg["session_end"], cfg["session_timezone"],
+        args.speed, csv_path,
+    )
+
+    # Spawn the data pipeline thread.
+    t = threading.Thread(
+        target=run_data_pipeline,
+        args=(
+            csv_path,
+            cfg["symbol"],
+            args.speed,
+            cfg["session_start"],
+            cfg["session_end"],
+            cfg["session_timezone"],
+        ),
+        daemon=True,
+    )
     t.start()
 
-    logger.info("Starting Dash server on http://0.0.0.0:8050")
-    # host=0.0.0.0 so Tailscale peers can reach it.
-    app.run(host="0.0.0.0", port=8050, debug=False)
+    logger.info("Starting Dash server on http://0.0.0.0:%d", args.port)
+    app.run(host="0.0.0.0", port=args.port, debug=False)
 
 
 if __name__ == "__main__":
