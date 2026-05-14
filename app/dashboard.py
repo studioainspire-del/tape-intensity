@@ -34,6 +34,7 @@ from dash import Dash, dcc, html, Input, Output, callback
 from plotly.subplots import make_subplots
 
 from adapters.csv_adapter import CSVAdapter
+from adapters.live_databento import DatabentoLiveAdapter
 from adapters.replay_adapter import ReplayAdapter
 from config import instruments as instrument_config
 from processor.intensity import IntensityProcessor, ProcessorState
@@ -81,23 +82,39 @@ _last_seen_wall: float = 0.0
 # ---------------------------------------------------------------------------
 
 def run_data_pipeline(
-    csv_path: Path,
-    symbol_filter: str,
+    *,
+    mode: str,
+    # CSV/replay mode args:
+    csv_path: Optional[Path],
+    symbol_filter: Optional[str],
     speed: float,
     session_start,
     session_end,
     session_timezone: str,
+    # Live mode args:
+    live_symbol: Optional[str],
 ) -> None:
-    """Run the adapter -> processor pipeline forever in this thread."""
+    """Run the adapter -> processor pipeline forever in this thread.
+
+    mode='replay': construct CSV + Replay adapters as before.
+    mode='live':   construct the Databento live adapter.
+    """
     async def _pipeline():
-        inner = CSVAdapter(csv_path, symbol_filter=symbol_filter)
-        adapter = ReplayAdapter(
-            inner,
-            speed=speed,
-            session_start=session_start,
-            session_end=session_end,
-            session_timezone=session_timezone,
-        )
+        if mode == "live":
+            adapter = DatabentoLiveAdapter(
+                symbol=live_symbol,
+                stype_in="continuous",
+            )
+        else:
+            inner = CSVAdapter(csv_path, symbol_filter=symbol_filter)
+            adapter = ReplayAdapter(
+                inner,
+                speed=speed,
+                session_start=session_start,
+                session_end=session_end,
+                session_timezone=session_timezone,
+            )
+
         await adapter.connect()
         try:
             await processor.consume(adapter)
@@ -192,7 +209,14 @@ def update_chart(_n: int, toggles: list[str]):
     show_price = "price" in toggles
 
     state = processor.get_state()
-    history.append(state)
+    # During warmup (before the first tick arrives, or before the
+    # smoothing window has filled), get_state() returns a zero-state
+    # with last_price=0.0. Appending those to history would pollute
+    # the price auto-scale (the range stretches from 0 to ~29620 for
+    # MNQ, making the real price line hug the top edge until the
+    # zero-states age out of the 3-minute window). Skip them.
+    if state.tick_count_in_window > 0:
+        history.append(state)
 
     # Staleness tracking, wall-clock anchored.
     now_wall = _time.monotonic()
@@ -224,60 +248,71 @@ def update_chart(_n: int, toggles: list[str]):
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
+    # Intensity traces go on the RIGHT axis (secondary_y=True).
+    # This is where the eye tracks aggression imbalance — the focus of
+    # the indicator. Price (when shown) is context on the left.
     if show_buy:
         fig.add_trace(
             go.Scatter(x=xs, y=buys, name="Buy",
                        line=dict(color=COLOR_BUY, width=2),
                        hovertemplate="%{y:.1f} c/s<extra>buy</extra>"),
-            secondary_y=False,
+            secondary_y=True,
         )
     if show_sell:
         fig.add_trace(
             go.Scatter(x=xs, y=sells, name="Sell",
                        line=dict(color=COLOR_SELL, width=2),
                        hovertemplate="%{y:.1f} c/s<extra>sell</extra>"),
-            secondary_y=False,
+            secondary_y=True,
         )
     if show_net:
         fig.add_trace(
             go.Scatter(x=xs, y=nets, name="Net",
                        line=dict(color=COLOR_NET, width=1.5, dash="dot"),
                        hovertemplate="%{y:+.1f} c/s<extra>net</extra>"),
-            secondary_y=False,
+            secondary_y=True,
         )
     if show_price:
         fig.add_trace(
             go.Scatter(x=xs, y=prices, name="Price",
                        line=dict(color=COLOR_PRICE, width=1.5),
                        hovertemplate=f"%{{y:.{price_decimals}f}}<extra>price</extra>"),
-            secondary_y=True,
+            secondary_y=False,
         )
 
-    # Left axis (intensity). If net is visible, allow negative space;
-    # otherwise pin baseline at zero for a cleaner look.
+    # Right axis (intensity, the focus axis). Gridlines, zero anchoring,
+    # and tozero rangemode all live here. If net is visible, allow
+    # negative space; otherwise pin baseline at zero for a cleaner look.
     if show_net:
-        fig.update_yaxes(secondary_y=False,
+        fig.update_yaxes(secondary_y=True,
                          color=COLOR_FG, title_text="contracts/sec",
-                         gridcolor="#222222",
+                         gridcolor="#222222", showgrid=True,
                          zeroline=True, zerolinecolor="#444444",
                          zerolinewidth=1)
     else:
-        fig.update_yaxes(rangemode="tozero", secondary_y=False,
+        fig.update_yaxes(rangemode="tozero", secondary_y=True,
                          color=COLOR_FG, title_text="contracts/sec",
-                         gridcolor="#222222")
+                         gridcolor="#222222", showgrid=True)
 
-    # Right axis (price). Visible only when price toggle is on.
+    # Left axis (price, context only). Visible only when price toggle
+    # is on. No gridlines — price gridlines would clutter the focus on
+    # intensity.
+    price_range_key = "off"
     if show_price and prices:
         p_min, p_max = min(prices), max(prices)
         p_pad = max((p_max - p_min) * 0.1, 0.25)
         fig.update_yaxes(range=[p_min - p_pad, p_max + p_pad],
-                         secondary_y=True, showgrid=False,
+                         secondary_y=False, showgrid=False,
                          color=COLOR_PRICE, title_text="",
                          visible=True)
+        # Dynamic uirevision so the price axis auto-scale takes effect
+        # on each redraw, not just the first one. See uirevision in
+        # update_layout below.
+        price_range_key = f"{round(p_min, 1)}_{round(p_max, 1)}"
     else:
-        # Hide the right axis entirely when price is off. This gives
-        # the intensity lines the full chart width.
-        fig.update_yaxes(secondary_y=True, visible=False)
+        # Hide the left axis entirely when price is off. This gives
+        # the intensity lines the full chart width on the right axis.
+        fig.update_yaxes(secondary_y=False, visible=False)
 
     fig.update_layout(
         paper_bgcolor=COLOR_BG,
@@ -296,7 +331,14 @@ def update_chart(_n: int, toggles: list[str]):
         # natural feel: drag to pan, scroll to zoom, double-click to
         # reset.
         dragmode="pan",
-        uirevision="static",
+        # uirevision controls when Plotly preserves vs. resets view
+        # state across redraws. We keep it stable for short stretches
+        # (so panning doesn't fight live updates every 200ms) but
+        # change it when the price range shifts meaningfully, so the
+        # right-axis auto-scale actually takes effect. Without this,
+        # the price line gets stuck at whatever range was set on the
+        # first draw.
+        uirevision=f"price_{price_range_key}",
     )
 
     # Status bar.
@@ -366,13 +408,22 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to a Databento trades CSV. "
-             "Default: sample_data/glbx-mdp3-20260410.trades.csv",
+             "Default: sample_data/glbx-mdp3-20260410.trades.csv. "
+             "Ignored if --live is set.",
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help="Connect to Databento Live instead of replaying a CSV. "
+             "Requires DATABENTO_API_KEY environment variable and an "
+             "active live data subscription.",
     )
     p.add_argument(
         "--speed",
         type=float,
         default=1.0,
-        help="Replay speed multiplier (1.0 = real-time). Default: 1.0",
+        help="Replay speed multiplier (1.0 = real-time). "
+             "Ignored if --live is set. Default: 1.0",
     )
     p.add_argument(
         "--port",
@@ -398,45 +449,54 @@ def main():
     except KeyError as e:
         raise SystemExit(str(e))
 
-    # Resolve CSV path. Default lives in the project root's sample_data.
-    if args.csv is not None:
-        csv_path = args.csv
-    else:
-        csv_path = (Path(__file__).parent.parent / "sample_data"
-                    / "glbx-mdp3-20260410.trades.csv")
-
-    if not csv_path.exists():
-        raise SystemExit(f"CSV not found: {csv_path}")
+    # Resolve CSV path only if we'll need it (replay mode).
+    csv_path: Optional[Path] = None
+    if not args.live:
+        if args.csv is not None:
+            csv_path = args.csv
+        else:
+            csv_path = (Path(__file__).parent.parent / "sample_data"
+                        / "glbx-mdp3-20260410.trades.csv")
+        if not csv_path.exists():
+            raise SystemExit(f"CSV not found: {csv_path}")
 
     # Initialize module globals that the callback reads.
     processor = IntensityProcessor(window_seconds=cfg["smoothing_seconds"])
     history = deque(maxlen=HISTORY_MAX)
     display_tz = ZoneInfo(cfg["session_timezone"])
     display_name = cfg["display_name"]
-    symbol = cfg["symbol"]
+    symbol = cfg["live_symbol"] if args.live else cfg["symbol"]
     price_decimals = cfg["price_decimals"]
 
     app.title = f"Tape Intensity {symbol}"
     app.layout = _build_layout()
 
-    logger.info(
-        "Starting: instrument=%s symbol=%s smoothing=%ss "
-        "session=%s-%s %s speed=%sx csv=%s",
-        args.instrument, cfg["symbol"], cfg["smoothing_seconds"],
-        cfg["session_start"], cfg["session_end"], cfg["session_timezone"],
-        args.speed, csv_path,
-    )
+    if args.live:
+        logger.info(
+            "Starting LIVE: instrument=%s live_symbol=%s smoothing=%ss",
+            args.instrument, cfg["live_symbol"], cfg["smoothing_seconds"],
+        )
+    else:
+        logger.info(
+            "Starting REPLAY: instrument=%s symbol=%s smoothing=%ss "
+            "session=%s-%s %s speed=%sx csv=%s",
+            args.instrument, cfg["symbol"], cfg["smoothing_seconds"],
+            cfg["session_start"], cfg["session_end"], cfg["session_timezone"],
+            args.speed, csv_path,
+        )
 
     # Spawn the data pipeline thread.
     t = threading.Thread(
         target=run_data_pipeline,
-        args=(
-            csv_path,
-            cfg["symbol"],
-            args.speed,
-            cfg["session_start"],
-            cfg["session_end"],
-            cfg["session_timezone"],
+        kwargs=dict(
+            mode="live" if args.live else "replay",
+            csv_path=csv_path,
+            symbol_filter=cfg["symbol"] if not args.live else None,
+            speed=args.speed,
+            session_start=cfg["session_start"],
+            session_end=cfg["session_end"],
+            session_timezone=cfg["session_timezone"],
+            live_symbol=cfg["live_symbol"] if args.live else None,
         ),
         daemon=True,
     )
