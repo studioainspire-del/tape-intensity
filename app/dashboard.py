@@ -128,7 +128,7 @@ def run_data_pipeline(
 # Dash app — layout built once, after main() configures globals
 # ---------------------------------------------------------------------------
 
-app = Dash(__name__)
+app = Dash(__name__, update_title=None)
 
 
 def _build_layout() -> html.Div:
