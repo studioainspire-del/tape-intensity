@@ -21,6 +21,7 @@ from typing import TypedDict
 class InstrumentConfig(TypedDict):
     display_name: str          # shown in the dashboard title
     symbol: str                # Databento contract code, e.g. "MNQM6"
+    live_symbol: str           # continuous form for live, e.g. "MNQ.c.0"
     tick_size: float           # smallest price increment
     price_decimals: int        # number of decimal places to display
     smoothing_seconds: float   # rolling window for the intensity rates
@@ -33,6 +34,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     "MNQ": {
         "display_name": "Micro Nasdaq",
         "symbol": "MNQM6",
+        "live_symbol": "MNQ.c.0",
         "tick_size": 0.25,
         "price_decimals": 2,
         "smoothing_seconds": 10.0,
@@ -43,6 +45,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     "NQ": {
         "display_name": "E-mini Nasdaq",
         "symbol": "NQM6",
+        "live_symbol": "NQ.c.0",
         "tick_size": 0.25,
         "price_decimals": 2,
         "smoothing_seconds": 10.0,
@@ -53,6 +56,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     "MGC": {
         "display_name": "Micro Gold",
         "symbol": "MGCM6",
+        "live_symbol": "MGC.c.0",
         "tick_size": 0.10,
         "price_decimals": 2,
         # GC is slower than NQ; longer smoothing window per the spec.
@@ -67,6 +71,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     "GC": {
         "display_name": "Gold",
         "symbol": "GCM6",
+        "live_symbol": "GC.c.0",
         "tick_size": 0.10,
         "price_decimals": 2,
         "smoothing_seconds": 17.0,
@@ -77,6 +82,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     "ES": {
         "display_name": "E-mini S&P 500",
         "symbol": "ESM6",
+        "live_symbol": "ES.c.0",
         "tick_size": 0.25,
         "price_decimals": 2,
         "smoothing_seconds": 10.0,
@@ -87,6 +93,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     "MES": {
         "display_name": "Micro E-mini S&P 500",
         "symbol": "MESM6",
+        "live_symbol": "MES.c.0",
         "tick_size": 0.25,
         "price_decimals": 2,
         "smoothing_seconds": 10.0,
