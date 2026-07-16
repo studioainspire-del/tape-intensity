@@ -16,25 +16,40 @@ Design summary:
   divides by window length. O(n) per call but n stays small (a few
   thousand at most for MNQ during heavy flow).
 
-- No locks. Python's GIL serializes deque mutations, and we never
-  yield mid-operation in a way that would split a logical update.
-  This assumption holds for single-process asyncio. If we ever move
-  to threads or multiprocessing, revisit.
+- No locks on the tick buffer. Python's GIL serializes deque
+  mutations, and we never yield mid-operation in a way that would
+  split a logical update. This assumption holds for single-process
+  asyncio. If we ever move to threads or multiprocessing, revisit.
+
+- Server-side history (Phase 7a). A second deque holds sampled
+  ProcessorStates so the dashboard survives backgrounded tabs and
+  page reloads. record_snapshot() is called at a fixed cadence by a
+  background task on the pipeline's asyncio loop; the history query
+  methods are called from the Dash callback on the Flask thread, so
+  the history deque (unlike the tick buffer) IS guarded by a lock —
+  iterating a deque while another thread appends raises RuntimeError.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from adapters.base import TickAdapter, TickEvent
 
 
 logger = logging.getLogger(__name__)
+
+
+# Server-side history capacity: 30 minutes at the 5 Hz sampler cadence.
+# Sized deliberately for Phase 7b's scrollback range — don't grow or
+# shrink without revisiting that plan.
+HISTORY_MAXLEN = 9000
 
 
 @dataclass(frozen=True)
@@ -74,6 +89,13 @@ class IntensityProcessor:
         # Most recent tick info, cached for get_state() without re-walking.
         self._last_tick_ts: Optional[datetime] = None
         self._last_price: float = 0.0
+
+        # Server-side history of sampled states (Phase 7a). Appended by
+        # record_snapshot() from the pipeline's asyncio loop, read by the
+        # dashboard callback from the Flask thread — hence the lock (see
+        # module docstring). Oldest snapshots roll off automatically.
+        self._history: deque[ProcessorState] = deque(maxlen=HISTORY_MAXLEN)
+        self._history_lock = threading.Lock()
 
         # Diagnostics.
         self.ticks_consumed = 0
@@ -167,3 +189,49 @@ class IntensityProcessor:
             last_tick_age_seconds=age,
             tick_count_in_window=len(self._buffer),
         )
+
+    # ------------------------------------------------------------------
+    # Server-side history (Phase 7a)
+    # ------------------------------------------------------------------
+
+    def record_snapshot(self, now: Optional[datetime] = None) -> None:
+        """Sample the current state into the server-side history.
+
+        Intended to be called at a fixed 5 Hz cadence by a background
+        task on the same loop as consume(). Warmup zero-states (nothing
+        ingested yet) are skipped so their last_price=0.0 can't pollute
+        the price auto-scale downstream — the same rule the browser-side
+        history followed before Phase 7a. No backfill: history begins at
+        the moment the sampler starts running.
+        """
+        state = self.get_state(now)
+        if state.tick_count_in_window == 0:
+            return
+        with self._history_lock:
+            self._history.append(state)
+
+    def get_history_window(
+        self, start_ts: datetime, end_ts: datetime
+    ) -> list[ProcessorState]:
+        """Return snapshots whose timestamp falls within [start_ts, end_ts].
+
+        Linear scan over the history deque. Capacity caps at
+        HISTORY_MAXLEN (9,000) entries, so this stays cheap at the
+        dashboard's 5 Hz read cadence.
+        """
+        with self._history_lock:
+            return [s for s in self._history if start_ts <= s.timestamp <= end_ts]
+
+    def get_recent_history(self, seconds: float) -> list[ProcessorState]:
+        """Return snapshots from the trailing `seconds` of history.
+
+        Anchored to the NEWEST SNAPSHOT's timestamp, not wall-clock now,
+        for the same reason get_state() prunes by tick time: during
+        replay, tick time and wall time diverge, and the visible window
+        should track the data, not the clock.
+        """
+        with self._history_lock:
+            if not self._history:
+                return []
+            end_ts = self._history[-1].timestamp
+        return self.get_history_window(end_ts - timedelta(seconds=seconds), end_ts)

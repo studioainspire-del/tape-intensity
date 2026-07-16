@@ -6,11 +6,9 @@ Connects to Databento's live gateway, subscribes to a single symbol
 as trades arrive in real time.
 
 Architecture notes:
-- The Databento Python SDK provides synchronous and async iteration
-  over the incoming record stream. We use sync iteration in a background
-  thread (the same thread that runs the asyncio event loop for the
-  rest of the adapter contract), bridging via asyncio.to_thread when
-  blocking on the network read.
+- The Databento Live client supports async iteration directly, so
+  stream() just does `async for record in client` on the pipeline's
+  event loop. No extra thread or executor bridging is involved.
 
 - TradeMsg records from the trades schema have the same field semantics
   as the historical CSV: ts_event (nanoseconds since epoch), price
@@ -18,7 +16,7 @@ Architecture notes:
   that we map back to the display symbol via SymbolMappingMsg records.
 
 - Price is scaled: every 1 unit = 1e-9 dollars. So a raw price of
-  25224500000000 represents $25224.500. The SDK's pretty_px property
+  25224500000000 represents $25224.500. The SDK's pretty_price property
   handles this for us, returning a Python float.
 
 - We track instrument_id -> symbol mappings as SymbolMappingMsg records

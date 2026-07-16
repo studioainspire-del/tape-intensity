@@ -10,10 +10,15 @@ Examples:
     python -m app.dashboard MNQ --csv sample_data/glbx-mdp3-20260410.trades.csv
     python -m app.dashboard MGC --csv data/gold_april10.csv --speed 5.0
 
-Architecture (unchanged from Phase 4):
+Architecture:
     Main thread: Dash/Flask server.
-    Background thread: asyncio loop, owns the adapter + consume task.
-    Shared state: the IntensityProcessor singleton.
+    Background thread: asyncio loop, owns the adapter + consume task,
+        plus (Phase 7a) the 5 Hz sampler task that records history
+        snapshots server-side.
+    Shared state: the IntensityProcessor singleton, which now also owns
+        the history buffer. The callback reads slices of it; it no
+        longer accumulates history browser-side, so backgrounded tabs
+        and page reloads no longer lose or sparsify history.
 """
 
 from __future__ import annotations
@@ -23,7 +28,6 @@ import asyncio
 import logging
 import threading
 import time as _time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -37,7 +41,7 @@ from adapters.csv_adapter import CSVAdapter
 from adapters.live_databento import DatabentoLiveAdapter
 from adapters.replay_adapter import ReplayAdapter
 from config import instruments as instrument_config
-from processor.intensity import IntensityProcessor, ProcessorState
+from processor.intensity import IntensityProcessor
 
 
 logger = logging.getLogger(__name__)
@@ -48,8 +52,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VISIBLE_WINDOW_SECONDS = 180   # 3-minute rolling view
-POLL_INTERVAL_MS = 200         # 5 Hz refresh
-HISTORY_MAX = 1200             # snapshots retained (5 Hz * 240s buffer)
+POLL_INTERVAL_MS = 200         # 5 Hz refresh; also the sampler cadence
 
 COLOR_BUY = "#00d68f"
 COLOR_SELL = "#ff5b5b"
@@ -66,7 +69,6 @@ COLOR_FG = "#cccccc"
 # These are set in main() once we have parsed args + loaded the instrument
 # config. They're module-level so the Dash callback can see them.
 processor: IntensityProcessor
-history: deque[ProcessorState]
 display_tz: ZoneInfo
 display_name: str
 symbol: str
@@ -99,6 +101,15 @@ def run_data_pipeline(
     mode='replay': construct CSV + Replay adapters as before.
     mode='live':   construct the Databento live adapter.
     """
+    async def _sampler():
+        # Phase 7a: record a history snapshot every 200ms, matching the
+        # dashboard poll cadence. Runs on the same loop as consume(), so
+        # snapshots interleave with ingestion without cross-thread races
+        # on the tick buffer. No backfill — history starts here.
+        while True:
+            processor.record_snapshot()
+            await asyncio.sleep(POLL_INTERVAL_MS / 1000.0)
+
     async def _pipeline():
         if mode == "live":
             adapter = DatabentoLiveAdapter(
@@ -117,7 +128,21 @@ def run_data_pipeline(
 
         await adapter.connect()
         try:
-            await processor.consume(adapter)
+            consume_task = asyncio.create_task(processor.consume(adapter))
+            sampler_task = asyncio.create_task(_sampler())
+            # consume() finishes when the stream is exhausted (replay) or
+            # dies (live disconnect); the sampler alone never finishes.
+            # Whichever ends first, cancel the other so the pipeline
+            # winds down instead of hanging on the survivor.
+            done, pending = await asyncio.wait(
+                {consume_task, sampler_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()  # surface any pipeline error
         finally:
             await adapter.disconnect()
 
@@ -208,15 +233,9 @@ def update_chart(_n: int, toggles: list[str]):
     show_net = "net" in toggles
     show_price = "price" in toggles
 
+    # Live state for the status bar. (Always live values — even after
+    # Phase 7b adds scrollback, the status bar stays pinned to now.)
     state = processor.get_state()
-    # During warmup (before the first tick arrives, or before the
-    # smoothing window has filled), get_state() returns a zero-state
-    # with last_price=0.0. Appending those to history would pollute
-    # the price auto-scale (the range stretches from 0 to ~29620 for
-    # MNQ, making the real price line hug the top edge until the
-    # zero-states age out of the 3-minute window). Skip them.
-    if state.tick_count_in_window > 0:
-        history.append(state)
 
     # Staleness tracking, wall-clock anchored.
     now_wall = _time.monotonic()
@@ -225,11 +244,12 @@ def update_chart(_n: int, toggles: list[str]):
         _last_seen_wall = now_wall
     staleness_seconds = now_wall - _last_seen_wall
 
-    if not history:
+    # Phase 7a: history lives server-side in the processor, sampled at
+    # 5 Hz by the pipeline's sampler task. Warmup zero-state skipping
+    # happens in record_snapshot(), so everything here is plottable.
+    recent = processor.get_recent_history(VISIBLE_WINDOW_SECONDS)
+    if not recent:
         return _empty_figure(), "no data"
-
-    latest_tick_ts = history[-1].timestamp
-    window_start = latest_tick_ts.timestamp() - VISIBLE_WINDOW_SECONDS
 
     xs: list[datetime] = []
     buys: list[float] = []
@@ -237,9 +257,7 @@ def update_chart(_n: int, toggles: list[str]):
     nets: list[float] = []
     prices: list[float] = []
 
-    for s in history:
-        if s.timestamp.timestamp() < window_start:
-            continue
+    for s in recent:
         xs.append(s.timestamp.astimezone(display_tz))
         buys.append(s.buy_rate)
         sells.append(s.sell_rate)
@@ -435,7 +453,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main():
-    global processor, history, display_tz, display_name, symbol, price_decimals
+    global processor, display_tz, display_name, symbol, price_decimals
 
     logging.basicConfig(
         level=logging.INFO,
@@ -462,7 +480,6 @@ def main():
 
     # Initialize module globals that the callback reads.
     processor = IntensityProcessor(window_seconds=cfg["smoothing_seconds"])
-    history = deque(maxlen=HISTORY_MAX)
     display_tz = ZoneInfo(cfg["session_timezone"])
     display_name = cfg["display_name"]
     symbol = cfg["live_symbol"] if args.live else cfg["symbol"]
