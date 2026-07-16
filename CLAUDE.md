@@ -111,7 +111,7 @@ Fixed by `update_title=None` in the `Dash(...)` constructor. If it returns, that
 
 ### Symptom: chart shows sparse straight-line segments when returning from a backgrounded tab
 
-Known limitation. Browser throttles `setInterval` calls in background tabs, so the dashboard's history deque (populated by the callback) accumulates sparse points. Data on the server is correct; the visualization fills back in within ~3 minutes of foreground time. Fix would be moving history population to a server-side task (decouple from the callback), not yet implemented.
+Fixed in Phase 7a: history is sampled server-side by a 5 Hz task in the data pipeline (`record_snapshot()` in `processor/intensity.py`), so browser tab throttling no longer affects it. If this symptom returns, check that the sampler task is actually running alongside `consume()` in `run_data_pipeline` — the callback only *reads* history now (`get_recent_history`), it must never populate it.
 
 ### Symptom: pan/zoom gets "stuck" and chart freezes
 
@@ -166,12 +166,21 @@ asyncio.run(main())
 
 6. **Browser cache strikes after JS changes.** When editing layout/Dash config and the browser doesn't reflect the change after restart, hard refresh with Ctrl+Shift+R. Python code reloads on restart; bundled JavaScript caches aggressively.
 
+## History buffer behavior (Phase 7a)
+
+The processor owns a server-side history of sampled states (`_history` in `processor/intensity.py`), populated at 5 Hz by a sampler task in the dashboard's pipeline thread. Things to know:
+
+- History starts **empty at processor startup** and fills at 5 Hz from that moment forward. There is no backfill — asking for a time before the processor started returns no data. Not a bug.
+- The buffer holds **30 minutes max** (9,000 snapshots at 5 Hz); oldest snapshots roll off first. Sized deliberately for Phase 7b's scrollback range.
+- **Warmup zero-states are not recorded.** Before the first tick arrives, `get_state()` returns `last_price=0.0` states; `record_snapshot()` skips them (same rule the browser-side history used, gotcha #3).
+- The sampler runs on the same asyncio loop as `consume()` — no extra thread. History reads from the Dash callback cross the thread boundary, which is why `_history` is lock-guarded while the tick buffer is not.
+
 ## What is NOT yet built (deliberate scope, not bugs)
 
 - Automatic live-feed reconnection on disconnect. Currently you restart the dashboard manually.
 - Databento sequence-gap detection.
 - Heartbeat-based health light integration (the wall-clock-staleness one works fine for most cases).
-- Server-side history (browser-tab-backgrounding workaround).
+- Scrollback UI (Phase 7b). The server-side history buffer behind it (Phase 7a) is done; the UI to pan the chart back through those 30 minutes is not.
 - "Live" button to snap back to live view after pan/zoom interaction.
 - Front-month auto-resolution for CSV mode raw symbols (live mode handles this via continuous symbology).
 - Tailscale on the home machine (installed but not verified working from phone / work MacBook).
