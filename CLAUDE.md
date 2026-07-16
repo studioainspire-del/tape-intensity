@@ -11,7 +11,7 @@ The chart works because aggressor side is asymmetric even though volume is symme
 ## Stack
 
 - Python 3.12, venv at `.venv/` (Windows: `.venv\Scripts\activate`)
-- Dash 4.1, Plotly 6.7, pandas, databento 0.78 (full list in `requirements.txt`)
+- Dash 4.1+, Plotly 6.7+, databento 0.78+ (pinned as compatible releases in `requirements.txt`; pandas was dropped — nothing imports it)
 - Async throughout (`asyncio`). Push-model adapters via async generators.
 - Plotly Dash dashboard runs on `0.0.0.0:8050` (bound this way for Tailscale LAN access)
 
