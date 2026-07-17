@@ -19,6 +19,10 @@ Architecture:
         the history buffer. The callback reads slices of it; it no
         longer accumulates history browser-side, so backgrounded tabs
         and page reloads no longer lose or sparsify history.
+    Scrollback (Phase 7b): dragging the chart pans back through the
+        server-side history; a LIVE badge (top-right, shown only while
+        panned) snaps back to the live edge. View state lives in module
+        globals — see the scrollback section below.
 """
 
 from __future__ import annotations
@@ -28,20 +32,20 @@ import asyncio
 import logging
 import threading
 import time as _time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output, callback
+from dash import Dash, ctx, dcc, html, no_update, Input, Output, callback
 from plotly.subplots import make_subplots
 
 from adapters.csv_adapter import CSVAdapter
 from adapters.live_databento import DatabentoLiveAdapter
 from adapters.replay_adapter import ReplayAdapter
 from config import instruments as instrument_config
-from processor.intensity import IntensityProcessor
+from processor.intensity import HISTORY_MAXLEN, IntensityProcessor
 
 
 logger = logging.getLogger(__name__)
@@ -54,12 +58,41 @@ logger = logging.getLogger(__name__)
 VISIBLE_WINDOW_SECONDS = 180   # 3-minute rolling view
 POLL_INTERVAL_MS = 200         # 5 Hz refresh; also the sampler cadence
 
+# Scrollback (Phase 7b): pan whose right edge lands within this many
+# seconds of the newest snapshot counts as "returned to live".
+LIVE_SNAP_SECONDS = 2.0
+# Full buffer span in seconds, derived from the processor's capacity and
+# the 5 Hz sampler cadence (= 30 minutes). Used to fetch the buffer
+# extent when interpreting a pan.
+HISTORY_SPAN_SECONDS = HISTORY_MAXLEN * (POLL_INTERVAL_MS / 1000.0)
+
 COLOR_BUY = "#00d68f"
 COLOR_SELL = "#ff5b5b"
 COLOR_PRICE = "#ffffff"
 COLOR_NET = "#ffcc00"
 COLOR_BG = "#111111"
 COLOR_FG = "#cccccc"
+
+# LIVE badge styling (Phase 7b): subtle corner-mounted button, only
+# visible while panned back. Absolute positioning relies on the graph's
+# wrapper div being position:relative.
+_LIVE_BTN_BASE = {
+    "position": "absolute",
+    "top": "10px",
+    "right": "16px",
+    "zIndex": 10,
+    "fontFamily": "monospace",
+    "fontSize": "12px",
+    "letterSpacing": "1px",
+    "color": COLOR_FG,
+    "backgroundColor": "rgba(255, 255, 255, 0.08)",
+    "border": "1px solid #444444",
+    "borderRadius": "3px",
+    "padding": "4px 10px",
+    "cursor": "pointer",
+}
+_LIVE_BTN_HIDDEN = {**_LIVE_BTN_BASE, "display": "none"}
+_LIVE_BTN_VISIBLE = {**_LIVE_BTN_BASE, "display": "block"}
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +110,101 @@ price_decimals: int
 # Staleness tracking for the health light.
 _last_seen_tick_ts: Optional[datetime] = None
 _last_seen_wall: float = 0.0
+
+# Scrollback view state (Phase 7b). Module globals rather than a
+# dcc.Store: this is a single-user dashboard with one server process,
+# and the staleness trackers above already follow this pattern.
+# _panned_end_ts anchors the frozen slice absolutely — the offset alone
+# would drift forward as the live edge advances between refreshes.
+_view_mode: str = "live"                   # "live" | "panned"
+_view_offset_seconds: float = 0.0          # seconds behind the live edge
+_panned_end_ts: Optional[datetime] = None  # right edge of the frozen slice
+# Bumped on every panned -> live transition and folded into the live
+# uirevision key. Plotly stores the user's pan state keyed to the
+# uirevision value active when they dragged; if the post-scrollback
+# live figure reused the pre-scrollback key, Plotly would RESTORE the
+# stale drag position instead of snapping to the live edge (and the
+# relayout echo of that restore would flip the server back to panned).
+_live_epoch: int = 0
+
+
+def _set_live() -> None:
+    """Reset scrollback state to the live edge."""
+    global _view_mode, _view_offset_seconds, _panned_end_ts, _live_epoch
+    if _view_mode != "live":
+        # Invalidate drag state stored under the previous live key.
+        # Only on a real transition — bumping while already live would
+        # reset the user's in-live zoom on every near-edge pan.
+        _live_epoch += 1
+    _view_mode = "live"
+    _view_offset_seconds = 0.0
+    _panned_end_ts = None
+
+
+def _handle_relayout(relayout_data: Optional[dict]) -> bool:
+    """Update scrollback state from a chart relayout event.
+
+    Returns True when the view state actually changed (mode or frozen
+    window), False otherwise. Ignoring no-op events matters: our own
+    axis-range updates can echo back as relayout events, and rebuilding
+    on those would fight the user's drag.
+    """
+    global _view_mode, _view_offset_seconds, _panned_end_ts
+
+    if not relayout_data:
+        return False
+    prev = (_view_mode, _panned_end_ts)
+
+    def _changed() -> bool:
+        return (_view_mode, _panned_end_ts) != prev
+
+    # Double-click autosize: snap back to live. (We never emit autorange
+    # figures while panned — panned figures carry an explicit x-range —
+    # so an autorange event here is always a user action.)
+    if relayout_data.get("xaxis.autorange"):
+        _set_live()
+        return _changed()
+
+    right_raw = relayout_data.get("xaxis.range[1]")
+    if right_raw is None:
+        # Y-only drag, dragmode change, etc. — not a horizontal pan.
+        return False
+
+    # Buffer extent: oldest and newest snapshot timestamps.
+    hist = processor.get_recent_history(HISTORY_SPAN_SECONDS)
+    if not hist:
+        _set_live()
+        return _changed()
+
+    try:
+        # Plotly reports date-axis ranges as naive strings in the axis's
+        # display timezone.
+        right_edge = datetime.fromisoformat(str(right_raw)).replace(
+            tzinfo=display_tz
+        )
+    except ValueError:
+        return False
+
+    earliest, latest = hist[0].timestamp, hist[-1].timestamp
+
+    if (latest - right_edge).total_seconds() <= LIVE_SNAP_SECONDS:
+        # Panned (or zoomed) with the right edge at the live edge.
+        _set_live()
+        return _changed()
+
+    # Hard stop at the buffer edge: the window's left side never slides
+    # past the earliest snapshot. Until the buffer holds one full window
+    # there is nothing to pan into, so stay live.
+    min_end = earliest + timedelta(seconds=VISIBLE_WINDOW_SECONDS)
+    if min_end >= latest:
+        _set_live()
+        return _changed()
+
+    end = min(max(right_edge, min_end), latest)
+    _view_mode = "panned"
+    _view_offset_seconds = (latest - end).total_seconds()
+    _panned_end_ts = end
+    return _changed()
 
 
 # ---------------------------------------------------------------------------
@@ -194,16 +322,29 @@ def _build_layout() -> html.Div:
                     ),
                 ],
             ),
-            dcc.Graph(
-                id="intensity-chart",
-                style={"height": "70vh"},
-                config={
-                    # Drag to pan, scroll wheel to zoom, double-click to autoscale.
-                    # Hides the modebar entirely since we don't need its other tools.
-                    "displayModeBar": False,
-                    "scrollZoom": True,
-                    "doubleClick": "autosize",
-                },
+            html.Div(
+                # Relative wrapper so the LIVE badge can corner-mount
+                # over the chart with absolute positioning.
+                style={"position": "relative"},
+                children=[
+                    dcc.Graph(
+                        id="intensity-chart",
+                        style={"height": "70vh"},
+                        config={
+                            # Drag to pan, scroll wheel to zoom, double-click to autoscale.
+                            # Hides the modebar entirely since we don't need its other tools.
+                            "displayModeBar": False,
+                            "scrollZoom": True,
+                            "doubleClick": "autosize",
+                        },
+                    ),
+                    html.Button(
+                        "LIVE",
+                        id="live-button",
+                        n_clicks=0,
+                        style=_LIVE_BTN_HIDDEN,
+                    ),
+                ],
             ),
             dcc.Interval(id="tick", interval=POLL_INTERVAL_MS, n_intervals=0),
         ],
@@ -221,10 +362,18 @@ def _health_from_age(age_seconds: float) -> tuple[str, str]:
 @callback(
     Output("intensity-chart", "figure"),
     Output("status-bar", "children"),
+    Output("live-button", "style"),
     Input("tick", "n_intervals"),
     Input("line-toggles", "value"),
+    Input("intensity-chart", "relayoutData"),
+    Input("live-button", "n_clicks"),
 )
-def update_chart(_n: int, toggles: list[str]):
+def update_chart(
+    _n: int,
+    toggles: list[str],
+    relayout_data: Optional[dict],
+    _live_clicks: int,
+):
     global _last_seen_tick_ts, _last_seen_wall
 
     toggles = toggles or []
@@ -233,8 +382,9 @@ def update_chart(_n: int, toggles: list[str]):
     show_net = "net" in toggles
     show_price = "price" in toggles
 
-    # Live state for the status bar. (Always live values — even after
-    # Phase 7b adds scrollback, the status bar stays pinned to now.)
+    # Live state for the status bar. Always live values, even while
+    # panned back — deliberate: pattern from the chart, numbers from
+    # the bar. Do not make this offset-aware.
     state = processor.get_state()
 
     # Staleness tracking, wall-clock anchored.
@@ -244,12 +394,44 @@ def update_chart(_n: int, toggles: list[str]):
         _last_seen_wall = now_wall
     staleness_seconds = now_wall - _last_seen_wall
 
-    # Phase 7a: history lives server-side in the processor, sampled at
-    # 5 Hz by the pipeline's sampler task. Warmup zero-state skipping
-    # happens in record_snapshot(), so everything here is plottable.
-    recent = processor.get_recent_history(VISIBLE_WINDOW_SECONDS)
+    # Scrollback state transitions (Phase 7b). One callback handles all
+    # four inputs because Dash allows only one writer per output, and
+    # tick, toggles, pan, and the LIVE button all need to redraw the
+    # same figure.
+    trigger = ctx.triggered_id
+    rebuild = True
+    if trigger == "live-button":
+        _set_live()
+    elif trigger == "intensity-chart":
+        # User pan/zoom (or an echo of our own axis update). Only
+        # rebuild when the view state really changed, so we neither
+        # fight the drag nor loop on echoes.
+        rebuild = _handle_relayout(relayout_data)
+    elif trigger == "tick" and _view_mode == "panned":
+        # Interval tick while panned: the slice is frozen. Skip the
+        # figure (no_update) but let the status bar refresh below —
+        # this is why the interval stays enabled in panned mode.
+        # (Toggle changes still rebuild, in either mode.)
+        rebuild = False
+
+    btn_style = _LIVE_BTN_VISIBLE if _view_mode == "panned" else _LIVE_BTN_HIDDEN
+
+    if not rebuild:
+        return no_update, _build_status(state, staleness_seconds), btn_style
+
+    # Select the visible slice. Live: trailing window off the newest
+    # snapshot (Phase 7a behavior). Panned: the frozen absolute window.
+    # Past the buffer edge we show only what exists — no query
+    # extension, the x-axis just spans less time.
+    if _view_mode == "panned" and _panned_end_ts is not None:
+        recent = processor.get_history_window(
+            _panned_end_ts - timedelta(seconds=VISIBLE_WINDOW_SECONDS),
+            _panned_end_ts,
+        )
+    else:
+        recent = processor.get_recent_history(VISIBLE_WINDOW_SECONDS)
     if not recent:
-        return _empty_figure(), "no data"
+        return _empty_figure(), "no data", _LIVE_BTN_HIDDEN
 
     xs: list[datetime] = []
     buys: list[float] = []
@@ -332,12 +514,36 @@ def update_chart(_n: int, toggles: list[str]):
         # the intensity lines the full chart width on the right axis.
         fig.update_yaxes(secondary_y=False, visible=False)
 
+    # uirevision controls when Plotly preserves vs. resets view state
+    # across redraws (Phase 6 gotcha #4).
+    # Live: dynamic key tied to the price range, so the right-axis
+    #   auto-scale keeps taking effect as price drifts — unchanged
+    #   behavior. Without this the price line gets stuck at whatever
+    #   range was set on the first draw.
+    # Panned (Phase 7b): key tied to the frozen window, so the user's
+    #   pan position survives refreshes of the same slice, while each
+    #   NEW pan changes the key and lets our axis range through. This
+    #   is delicate — a constant key here would let Plotly ignore the
+    #   clamped range on buffer-edge hits, re-showing empty space.
+    if _view_mode == "panned" and _panned_end_ts is not None:
+        uirev = f"panned_{int(_panned_end_ts.timestamp())}"
+        # Explicit x-range = the slice's actual data extent. Implements
+        # the hard stop (a drag past the edge snaps back to the clamped
+        # window) and shows a shorter axis when less data exists.
+        xaxis_cfg = dict(color=COLOR_FG, gridcolor="#222222",
+                         range=[xs[0], xs[-1]])
+    else:
+        # _live_epoch guarantees this key is never a key the user
+        # dragged under before a scrollback excursion (see its comment).
+        uirev = f"price_{_live_epoch}_{price_range_key}"
+        xaxis_cfg = dict(color=COLOR_FG, gridcolor="#222222")
+
     fig.update_layout(
         paper_bgcolor=COLOR_BG,
         plot_bgcolor=COLOR_BG,
         font=dict(color=COLOR_FG, family="monospace"),
         margin=dict(l=50, r=50, t=20, b=40),
-        xaxis=dict(color=COLOR_FG, gridcolor="#222222"),
+        xaxis=xaxis_cfg,
         showlegend=True,
         legend=dict(orientation="h", yanchor="top", y=1.08,
                     xanchor="right", x=1.0,
@@ -349,21 +555,18 @@ def update_chart(_n: int, toggles: list[str]):
         # natural feel: drag to pan, scroll to zoom, double-click to
         # reset.
         dragmode="pan",
-        # uirevision controls when Plotly preserves vs. resets view
-        # state across redraws. We keep it stable for short stretches
-        # (so panning doesn't fight live updates every 200ms) but
-        # change it when the price range shifts meaningfully, so the
-        # right-axis auto-scale actually takes effect. Without this,
-        # the price line gets stuck at whatever range was set on the
-        # first draw.
-        uirevision=f"price_{price_range_key}",
+        uirevision=uirev,
     )
 
-    # Status bar.
+    return fig, _build_status(state, staleness_seconds), btn_style
+
+
+def _build_status(state, staleness_seconds: float) -> html.Div:
+    """Build the status bar. Always live values — never offset-aware."""
     health_color, health_label = _health_from_age(staleness_seconds)
     last_tick_str = state.timestamp.astimezone(display_tz).strftime("%H:%M:%S")
     price_str = f"{state.last_price:.{price_decimals}f}"
-    status = html.Div(
+    return html.Div(
         style={"display": "flex", "gap": "20px", "alignItems": "center"},
         children=[
             html.Span([
@@ -385,7 +588,6 @@ def update_chart(_n: int, toggles: list[str]):
                       style={"color": "#888888"}),
         ],
     )
-    return fig, status
 
 
 def _empty_figure() -> go.Figure:
