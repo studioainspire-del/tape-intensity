@@ -115,7 +115,9 @@ Fixed in Phase 7a: history is sampled server-side by a 5 Hz task in the data pip
 
 ### Symptom: pan/zoom gets "stuck" and chart freezes
 
-Plotly's `uirevision` preserves user view state across refreshes. The current dynamic uirevision tag changes as the price range changes, which limits stickiness but lets auto-scale keep working. If you want stronger pan stickiness, coarsen the rounding in `price_range_key`. A page refresh always resets to live view.
+Since Phase 7b, panning back is a *feature*: any leftward drag enters scrollback mode, which deliberately freezes the chart on a fixed 3-minute slice (the LIVE badge appears top-right). Click LIVE, pan the right edge back to within ~2s of the newest snapshot, or double-click, to resume live updates. A page refresh always resets to live view. If the chart is frozen *without* the LIVE badge showing, that's a real bug — check `_view_mode` consistency in `app/dashboard.py`.
+
+uirevision mechanics: live mode uses the dynamic price-range key (auto-scale keeps working, gotcha #4) *prefixed with a live-epoch counter*; panned mode keys uirevision to the frozen window's end timestamp so the pan position survives refreshes while each new pan lets the clamped axis range through. The epoch counter (`_live_epoch`) bumps on every panned→live transition — Plotly stores drag state keyed to the uirevision value active when the user dragged, and without the bump, returning to live with an unchanged price key makes Plotly *restore the stale panned position* instead of snapping to the live edge (whose relayout echo then flips the server back to panned — symptom: LIVE button click appears to do nothing, or the badge blinks off and back on). If pan feels like it's "fighting" or snapping unpredictably, look here first.
 
 ## Running the live diagnostic
 
@@ -175,12 +177,21 @@ The processor owns a server-side history of sampled states (`_history` in `proce
 - **Warmup zero-states are not recorded.** Before the first tick arrives, `get_state()` returns `last_price=0.0` states; `record_snapshot()` skips them (same rule the browser-side history used, gotcha #3).
 - The sampler runs on the same asyncio loop as `consume()` — no extra thread. History reads from the Dash callback cross the thread boundary, which is why `_history` is lock-guarded while the tick buffer is not.
 
+## Scrollback UI (Phase 7b)
+
+Drag the chart left to pan back through the server-side history buffer; the visible slice is always 3 minutes wide — panning picks *which* 3 minutes. Behavior contract:
+
+- **Entering scrollback**: any pan that leaves the right edge more than ~2 seconds behind the newest snapshot. No threshold beyond that — you're either at the live edge or you're not.
+- **Returning to live**: click the LIVE badge (top-right of the chart, visible only while panned), pan the right edge back to within ~2 seconds of the newest snapshot, or double-click (autosize).
+- **Buffer edge**: hard stop at the earliest snapshot. A drag past it snaps back to the edge window on release — no empty space, no message. Until the buffer holds a full 3 minutes there is nothing to pan into and the chart stays live.
+- **Status bar and health light always show live values**, never the historical moment. Deliberate: pattern from the chart, numbers from the bar. Do not build offset-aware status logic.
+- **Auto-refresh while panned**: the figure is frozen via `dash.no_update`, but the `dcc.Interval` keeps firing so the status bar stays live — do not disable the interval, that freezes the health light. The 5 Hz sampler keeps filling the buffer regardless of view mode.
+- **View state** (`_view_mode`, `_view_offset_seconds`, `_panned_end_ts`) is module globals in `app/dashboard.py`, not a `dcc.Store` — single-user dashboard, same pattern as the staleness trackers. `_panned_end_ts` anchors the frozen slice absolutely; the offset alone would drift as the live edge advances.
+
 ## What is NOT yet built (deliberate scope, not bugs)
 
 - Automatic live-feed reconnection on disconnect. Currently you restart the dashboard manually.
 - Databento sequence-gap detection.
 - Heartbeat-based health light integration (the wall-clock-staleness one works fine for most cases).
-- Scrollback UI (Phase 7b). The server-side history buffer behind it (Phase 7a) is done; the UI to pan the chart back through those 30 minutes is not.
-- "Live" button to snap back to live view after pan/zoom interaction.
 - Front-month auto-resolution for CSV mode raw symbols (live mode handles this via continuous symbology).
 - Tailscale on the home machine (installed but not verified working from phone / work MacBook).
