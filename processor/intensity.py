@@ -21,6 +21,14 @@ Design summary:
   split a logical update. This assumption holds for single-process
   asyncio. If we ever move to threads or multiprocessing, revisit.
 
+- Cumulative counters (Phase 8). Alongside the windowed rates, the
+  processor keeps a running signed-volume sum (CVD) and a running total
+  volume. CVD is reported relative to a baseline that re-zeros at the
+  configured session open; total volume is raw — its consumers (RVOL)
+  only take differences between samples. Both ride into the history
+  buffer via ProcessorState, so scrollback and lookback windows get
+  them for free.
+
 - Server-side history (Phase 7a). A second deque holds sampled
   ProcessorStates so the dashboard survives backgrounded tabs and
   page reloads. record_snapshot() is called at a fixed cadence by a
@@ -37,8 +45,9 @@ import logging
 import threading
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date as dt_date, datetime, time as dt_time, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from adapters.base import TickAdapter, TickEvent
 
@@ -65,6 +74,8 @@ class ProcessorState:
     last_price: float                # most recent tick's price
     last_tick_age_seconds: float     # wall-clock seconds since last tick (for health)
     tick_count_in_window: int        # diagnostic: ticks currently in rolling buffer
+    cvd: int = 0                     # cumulative volume delta since session baseline
+    cum_volume: int = 0              # total contracts since processor start (unbaselined)
 
 
 class IntensityProcessor:
@@ -72,13 +83,27 @@ class IntensityProcessor:
 
     Args:
         window_seconds: smoothing window length. 10 for NQ/MNQ, 15-20 for GC/MGC.
+        session_open: optional session-open time (e.g. time(8, 30)). When
+            set, the CVD baseline re-zeros at the first tick at/after this
+            time each local day, so a dashboard launched pre-market (6 AM)
+            reports CVD "since the open", not "since launch". Pre-open
+            ticks still accumulate and are visible; the baseline snap
+            simply re-zeros the reported value at the crossing.
+        session_timezone: IANA tz name for interpreting session_open.
     """
 
-    def __init__(self, window_seconds: float = 10.0):
+    def __init__(
+        self,
+        window_seconds: float = 10.0,
+        session_open: Optional[dt_time] = None,
+        session_timezone: str = "America/Chicago",
+    ):
         if window_seconds <= 0:
             raise ValueError(f"window_seconds must be positive, got {window_seconds}")
 
         self.window_seconds = window_seconds
+        self._session_open = session_open
+        self._session_tz = ZoneInfo(session_timezone)
 
         # Buffer entries: (timestamp, size, signed_size)
         #   timestamp: tick's event timestamp (UTC, from the adapter)
@@ -89,6 +114,16 @@ class IntensityProcessor:
         # Most recent tick info, cached for get_state() without re-walking.
         self._last_tick_ts: Optional[datetime] = None
         self._last_price: float = 0.0
+
+        # Cumulative counters (Phase 8). _cvd is the raw signed running
+        # sum; the reported value is _cvd - _cvd_baseline, where the
+        # baseline snaps at the session-open crossing (see __init__).
+        # _cum_volume is never baselined — RVOL consumers only ever take
+        # differences between two samples, so an offset cancels out.
+        self._cvd: int = 0
+        self._cum_volume: int = 0
+        self._cvd_baseline: int = 0
+        self._baseline_date: Optional[dt_date] = None
 
         # Server-side history of sampled states (Phase 7a). Appended by
         # record_snapshot() from the pipeline's asyncio loop, read by the
@@ -116,6 +151,22 @@ class IntensityProcessor:
     def _ingest(self, tick: TickEvent) -> None:
         """Add one tick to the buffer. Called from consume()."""
         signed = tick.size if tick.aggressor_side == "buy" else -tick.size
+
+        # CVD baseline snap (Phase 8): the first tick at/after the
+        # session open each local day re-zeros the reported CVD. Checked
+        # BEFORE accumulating so the crossing tick itself counts toward
+        # the new session. The date guard makes this fire once per day,
+        # covering both a pre-market launch (baseline snaps at the open)
+        # and an in-session launch (snaps immediately, baseline 0).
+        if self._session_open is not None:
+            local_dt = tick.timestamp.astimezone(self._session_tz)
+            if (local_dt.time() >= self._session_open
+                    and self._baseline_date != local_dt.date()):
+                self._cvd_baseline = self._cvd
+                self._baseline_date = local_dt.date()
+
+        self._cvd += signed
+        self._cum_volume += tick.size
         self._buffer.append((tick.timestamp, tick.size, signed))
         self._last_tick_ts = tick.timestamp
         self._last_price = tick.price
@@ -147,6 +198,8 @@ class IntensityProcessor:
                 last_price=0.0,
                 last_tick_age_seconds=float("inf"),
                 tick_count_in_window=0,
+                cvd=0,
+                cum_volume=0,
             )
 
         # Prune anything older than (last_tick_ts - window_seconds).
@@ -188,6 +241,8 @@ class IntensityProcessor:
             last_price=self._last_price,
             last_tick_age_seconds=age,
             tick_count_in_window=len(self._buffer),
+            cvd=self._cvd - self._cvd_baseline,
+            cum_volume=self._cum_volume,
         )
 
     # ------------------------------------------------------------------
