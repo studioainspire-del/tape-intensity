@@ -4,7 +4,7 @@ Project context for Claude Code sessions on this repository.
 
 ## What this is
 
-A custom real-time orderflow indicator for day-trading CME futures (MNQ, MGC, with config for NQ/GC/ES/MES). Displays aggressive buy intensity, aggressive sell intensity, net delta, and price on a 3-minute scrolling chart. Used as a confirmation read at user-defined areas of interest, alongside Jigsaw Trading. **Not** a primary signal generator.
+A custom real-time orderflow indicator for day-trading CME futures (MNQ, MGC, with config for NQ/GC/ES/MES). Displays aggressive buy intensity, aggressive sell intensity, net delta, and price on a 3-minute scrolling chart, plus CVD and RVOL panels stacked below it (Phase 8). Used as a confirmation read at user-defined areas of interest, alongside Jigsaw Trading. **Not** a primary signal generator.
 
 The chart works because aggressor side is asymmetric even though volume is symmetric. Volume always balances; aggression rarely does. Buy intensity = contracts/sec hitting the ask, sell intensity = contracts/sec hitting the bid, both smoothed over a rolling window.
 
@@ -31,7 +31,7 @@ tape-intensity/
 ## Three-layer architecture (strict separation — preserve when editing)
 
 1. **Adapter layer** (`adapters/`): async generators yielding `TickEvent` objects. Anything source-specific (Databento side codes, vendor field names, timestamp formats) is translated to `TickEvent` *inside the adapter*. The processor must never see source-specific data.
-2. **Processor layer** (`processor/intensity.py`): source-agnostic. Maintains rolling buffer, computes smoothed rates. Push model: `consume(adapter)` runs in a background task; `get_state()` returns a snapshot for the dashboard to read.
+2. **Processor layer** (`processor/intensity.py`): source-agnostic. Maintains rolling buffer, computes smoothed rates, and keeps cumulative CVD/volume counters (Phase 8). Push model: `consume(adapter)` runs in a background task; `get_state()` returns a snapshot for the dashboard to read.
 3. **Visualization layer** (`app/dashboard.py`): Dash callback polls `processor.get_state()` at 5 Hz, builds Plotly figure. Doesn't know what adapter is feeding the processor.
 
 ### Adapter swappability
@@ -168,6 +168,10 @@ asyncio.run(main())
 
 6. **Browser cache strikes after JS changes.** When editing layout/Dash config and the browser doesn't reflect the change after restart, hard refresh with Ctrl+Shift+R. Python code reloads on restart; bundled JavaScript caches aggressively.
 
+7. **Dash trigger attribution is lossy under the 5 Hz interval — detect user events by VALUE, not by `ctx.triggered`.** A button press or pan that lands while a callback request is in flight gets coalesced into the next tick request: the input's new value arrives, but `changedPropIds` says "tick" (measured ~1-in-6 press loss before the fix). Hence `_btn_seen` (monotonic n_clicks tracking; only a zero resets, because a stale concurrent request carrying an old count must not regress it) and `_relayout_seen`/`_click_seen` (single-deep value diff — a rare stale re-apply self-corrects on the next tick, whereas deeper matching would permanently swallow legitimate repeats). Related: the whole callback body is serialized by `_callback_lock` — Flask's threaded server otherwise interleaves request bodies mid-bookkeeping, which produced 50% scrollback-state corruption in browser tests. Do not remove the lock or revert to trigger-attribution routing.
+
+8. **The figure-rebuild guard doubles as a hover fix.** Tick refreshes skip rebuilding when nothing changed (`_last_live_build_ts` + `_last_build_toggles`); besides saving CPU, this stops needless `Plotly.react` churn from clearing the browser's hover state, which made chart clicks unreliable. The "drop Δ anchor" button exists because chart-click anchor drops depend on that hover pipeline; the button path must stay.
+
 ## History buffer behavior (Phase 7a)
 
 The processor owns a server-side history of sampled states (`_history` in `processor/intensity.py`), populated at 5 Hz by a sampler task in the dashboard's pipeline thread. Things to know:
@@ -188,10 +192,30 @@ Drag the chart left to pan back through the server-side history buffer; the visi
 - **Auto-refresh while panned**: the figure is frozen via `dash.no_update`, but the `dcc.Interval` keeps firing so the status bar stays live — do not disable the interval, that freezes the health light. The 5 Hz sampler keeps filling the buffer regardless of view mode.
 - **View state** (`_view_mode`, `_view_offset_seconds`, `_panned_end_ts`) is module globals in `app/dashboard.py`, not a `dcc.Store` — single-user dashboard, same pattern as the staleness trackers. `_panned_end_ts` anchors the frozen slice absolutely; the offset alone would drift as the live edge advances.
 
+## Volume panels (Phase 8): CVD + RVOL
+
+Two panels stacked under the aggressor chart. They are rows of the *same* Plotly figure with a shared x-axis, so unified hover, scrollback, and uirevision apply to all panels at once — never split them into separate `dcc.Graph`s, each would need its own synced pan-state machine. Toggling a panel off collapses its row; the main panel regains the height.
+
+### CVD (cumulative volume delta)
+
+- Running sum of signed volume (+size for aggressive buys, −size for sells), accumulated in the processor and sampled into history like everything else — scrollback shows historical CVD for free.
+- **Baseline snaps at the session open** (`session_start` from the instrument config — 8:30 America/Chicago for MNQ/NQ/ES/MES, 7:20 for MGC/GC). Launched pre-market: pre-open CVD accumulates visibly, then the reported value re-zeros at the first tick at/after the open. Launched mid-session: counts from launch. The snap fires once per local day, so a left-running live instance re-baselines at the next open.
+- **"drop Δ anchor" button (toggles row) is the primary way to set the anchor** — anchors at the live edge, or at the frozen moment while panned back (pan to the zone touch, press drop). Press again any time to re-anchor. Chart clicks also drop the anchor at the clicked time, but that path depends on Plotly's hover pipeline having points under the cursor and silently misses sometimes on an updating figure — the button never misses; treat clicks as a bonus, not the contract. The status bar gains a bold `Δcvd` readout (CVD now − CVD at anchor); a dotted vertical marker shows on the CVD panel while the anchor is in view. "clear Δ anchor" (visible only while anchored) removes it.
+- The anchor stores its CVD value as a **scalar at drop time** — do not "improve" this into a history lookup. The history buffer holds only 30 minutes; the scalar keeps Δcvd working all session after the anchor's timestamp rolls off.
+
+### RVOL (relative volume)
+
+- `RVOL = (volume rate over the trailing 60s) / (volume rate over the trailing 300s)` — "is this minute busier than the last five?" Both windows span-normalized by the history actually available, so partial windows degrade gracefully instead of spiking. Constants: `RVOL_FAST_SECONDS` / `RVOL_SLOW_SECONDS` / `RVOL_MIN_BASELINE_SECONDS` in `app/dashboard.py`.
+- Reads as a multiple: 1.0x = this minute at the recent norm, 2.0x = double, 0.5x = half. Dotted reference line at 1.0x.
+- **Shows gaps (and `rvol --` in the status bar) until history spans ≥2 minutes.** Not a bug — the baseline is warming up. Expect it after every processor start.
+- Computed dashboard-side from history samples of the raw cumulative volume counter; the figure fetch pulls `VISIBLE_WINDOW_SECONDS + RVOL_SLOW_SECONDS` of history so the panel's left edge still has a full lookback. The counter is never baselined — RVOL only takes differences, so offsets cancel.
+- Status bar shows live `cvd`, `Δcvd` (when anchored), and `rvol` — live values only, per the Phase 7b rule.
+
 ## What is NOT yet built (deliberate scope, not bugs)
 
 - Automatic live-feed reconnection on disconnect. Currently you restart the dashboard manually.
 - Databento sequence-gap detection.
 - Heartbeat-based health light integration (the wall-clock-staleness one works fine for most cases).
+- RVOL against a multi-day historical baseline ("volume vs. typical for this time of day"). Current RVOL is intraday-relative — last minute vs. the last five.
 - Front-month auto-resolution for CSV mode raw symbols (live mode handles this via continuous symbology).
 - Tailscale on the home machine (installed but not verified working from phone / work MacBook).
