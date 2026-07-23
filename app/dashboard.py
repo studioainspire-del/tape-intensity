@@ -76,6 +76,15 @@ RVOL_FAST_SECONDS = 60.0          # numerator window ("this minute")
 RVOL_SLOW_SECONDS = 300.0         # baseline window ("last five minutes")
 RVOL_MIN_BASELINE_SECONDS = 120.0  # below this much history, show no RVOL
 
+# Live uirevision stability bucket. The live-mode uirevision advances
+# with the live edge quantized to this many seconds. It must change
+# often enough that the x-axis keeps scrolling and both y-axes keep
+# auto-scaling (a constant key is the gotcha #4 lockout), but stay
+# constant across short windows so Plotly does NOT re-autorange
+# mid-gesture and clobber a pan-back before it registers as scrollback.
+# ~1s balances a live-feeling scroll against solid pan entry.
+LIVE_UIREV_BUCKET_SECONDS = 1.0
+
 COLOR_BUY = "#00d68f"
 COLOR_SELL = "#ff5b5b"
 COLOR_PRICE = "#ffffff"
@@ -803,17 +812,16 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
     # Left axis (price, context only). Visible only when price toggle
     # is on. No gridlines — price gridlines would clutter the focus on
     # intensity.
-    price_range_key = "off"
     if show_price and prices:
         p_min, p_max = min(prices), max(prices)
         p_pad = max((p_max - p_min) * 0.1, 0.25)
+        # Explicit range, re-applied every build; combined with the
+        # live-edge uirevision below it takes effect on each redraw,
+        # not just the first (the Phase 6 "price stuck" fix).
         fig.update_yaxes(range=[p_min - p_pad, p_max + p_pad],
                          secondary_y=False, row=1, col=1, showgrid=False,
                          color=COLOR_PRICE, title_text="",
                          visible=True)
-        # Dynamic uirevision so the price axis auto-scale takes effect
-        # on each redraw, not just the first one. See uirevision below.
-        price_range_key = f"{round(p_min, 1)}_{round(p_max, 1)}"
     else:
         # Hide the left axis entirely when price is off. This gives
         # the intensity lines the full chart width on the right axis.
@@ -858,17 +866,31 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
 
     # uirevision controls when Plotly preserves vs. resets view state
     # across redraws (Phase 6 gotcha #4).
-    # Live: dynamic key tied to the price range, so the right-axis
-    #   auto-scale keeps taking effect as price drifts. The _live_epoch
-    #   prefix guarantees the key is never one the user dragged under
-    #   before a scrollback excursion (see its comment).
+    # Live: key on the live edge, quantized to LIVE_UIREV_BUCKET_SECONDS.
+    #   Advancing the key is what makes Plotly re-apply autorange as data
+    #   arrives — i.e. what keeps the x-axis scrolling and BOTH y-axes
+    #   auto-scaling. A CONSTANT key is the gotcha #4 lockout: once the
+    #   user zooms/pans, the view freezes and never re-follows the live
+    #   edge (this was the price-off freeze — the old key was the price
+    #   range, dynamic only while the price line showed). The bucket
+    #   keeps the key steady across ~1s windows so react does not
+    #   re-autorange mid-gesture and clobber a pan-back before it
+    #   registers; a stray zoom that stays within the live edge instead
+    #   self-heals at the next bucket flip. _live_epoch still prefixes
+    #   it so a panned->live return can't restore a stale drag position.
     # Panned (Phase 7b): key tied to the frozen window, so the user's
     #   pan position survives refreshes of the same slice, while each
     #   NEW pan changes the key and lets our axis range through.
     if _view_mode == "panned" and _panned_end_ts is not None:
         uirev = f"panned_{int(_panned_end_ts.timestamp())}"
     else:
-        uirev = f"price_{_live_epoch}_{price_range_key}"
+        # Bucket on WALL-CLOCK, not tick time: the stability window is a
+        # real-interaction window (how long a human gesture takes), so
+        # it must not stretch or shrink with replay speed. At live 1x
+        # this equals tick time; under accelerated replay it stays a
+        # true ~1s. (Same wall-clock framing as the health light.)
+        bucket = int(_time.monotonic() / LIVE_UIREV_BUCKET_SECONDS)
+        uirev = f"live_{_live_epoch}_{bucket}"
 
     fig.update_layout(
         paper_bgcolor=COLOR_BG,

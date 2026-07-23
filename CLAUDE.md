@@ -94,7 +94,11 @@ This is the warmup-zero-state bug pattern. Should be fixed already (see `app/das
 
 ### Symptom: price line stuck at unrealistic value (e.g. flat at 30000 when actual price is 29620)
 
-Y-axis auto-scale isn't updating across refreshes. The dashboard uses a *dynamic* `uirevision` tied to `price_range_key` precisely to prevent this. If you change the uirevision behavior, test that auto-scale still tracks price drift over a few minutes.
+Y-axis auto-scale isn't updating across refreshes. In live mode the dashboard uses a `uirevision` that advances with the live edge (a wall-clock bucket) precisely so autorange keeps re-applying. If you change the uirevision behavior, test that auto-scale still tracks price drift over a few minutes. See the pan/zoom symptom below for the full uirevision mechanics.
+
+### Symptom: toggling the price line off freezes the chart (x-scroll and/or intensity auto-scale stop)
+
+Fixed (Phase 8.1). Root cause was the gotcha #4 lockout: the live `uirevision` used to be keyed on the price range, which is only dynamic while the price line is shown. With price off the key became a constant `"off"`, so once the user zoomed or panned, Plotly retained that interaction forever — the x-axis stopped scrolling and the intensity y-axis stopped auto-scaling. The live key is now the wall-clock–bucketed live edge (`LIVE_UIREV_BUCKET_SECONDS`), independent of which traces are shown. If this returns, check that the live-mode `uirev` still advances when price is off.
 
 ### Symptom: health light always red
 
@@ -117,7 +121,12 @@ Fixed in Phase 7a: history is sampled server-side by a 5 Hz task in the data pip
 
 Since Phase 7b, panning back is a *feature*: any leftward drag enters scrollback mode, which deliberately freezes the chart on a fixed 3-minute slice (the LIVE badge appears top-right). Click LIVE, pan the right edge back to within ~2s of the newest snapshot, or double-click, to resume live updates. A page refresh always resets to live view. If the chart is frozen *without* the LIVE badge showing, that's a real bug — check `_view_mode` consistency in `app/dashboard.py`.
 
-uirevision mechanics: live mode uses the dynamic price-range key (auto-scale keeps working, gotcha #4) *prefixed with a live-epoch counter*; panned mode keys uirevision to the frozen window's end timestamp so the pan position survives refreshes while each new pan lets the clamped axis range through. The epoch counter (`_live_epoch`) bumps on every panned→live transition — Plotly stores drag state keyed to the uirevision value active when the user dragged, and without the bump, returning to live with an unchanged price key makes Plotly *restore the stale panned position* instead of snapping to the live edge (whose relayout echo then flips the server back to panned — symptom: LIVE button click appears to do nothing, or the badge blinks off and back on). If pan feels like it's "fighting" or snapping unpredictably, look here first.
+uirevision mechanics (three interacting pieces — change nothing here without re-testing all of it):
+- **Live mode** keys uirevision on the live edge bucketed to `LIVE_UIREV_BUCKET_SECONDS` (~1s, wall-clock). It must *advance* so Plotly re-applies autorange (x-scroll + both y-axes auto-scale, gotcha #4) — a constant key freezes the view after any interaction (that was the price-off freeze bug). It must *not* advance every tick, or react re-autoranges mid-gesture and clobbers a pan-back before it registers as scrollback. The ~1s bucket is the balance: steady across a human gesture, advancing fast enough to feel live. It's **wall-clock** bucketed, not tick-time, so replay speed doesn't stretch/shrink the stability window (same wall-clock framing as the health light). A stray zoom that stays within the live edge self-heals at the next bucket flip.
+- **Panned mode** keys uirevision to the frozen window's end timestamp, so the pan position survives refreshes while each new pan lets the clamped axis range through.
+- **`_live_epoch`** prefixes the live key and bumps on every panned→live transition. Plotly stores drag state keyed to the uirevision value active when the user dragged; without the bump, returning to live with an unchanged key makes Plotly *restore the stale panned position* instead of snapping to the live edge (whose relayout echo then flips the server back to panned — symptom: LIVE click appears to do nothing, or the badge blinks off and back on).
+
+If pan feels like it's "fighting" or snapping unpredictably, look here first. Note: scrollback only engages once the buffer holds a full `VISIBLE_WINDOW_SECONDS` (there's nothing to pan into before that) — a fresh start "ignoring" pans for the first ~3 minutes is that guard, not a bug.
 
 ## Running the live diagnostic
 
