@@ -542,7 +542,9 @@ def _build_layout() -> html.Div:
             ),
             html.Div(
                 # Relative wrapper so the LIVE badge can corner-mount
-                # over the chart with absolute positioning.
+                # over the chart with absolute positioning. The id is
+                # also the anchor assets/crosshair.js attaches to.
+                id="chart-wrapper",
                 style={"position": "relative"},
                 children=[
                     dcc.Graph(
@@ -914,7 +916,11 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
     # Shared x styling applies to every row's axis (shared_xaxes keeps
     # them matched). Explicit range while panned implements the
     # hard-stop snap and the shorter-axis case at the buffer edge.
-    fig.update_xaxes(color=COLOR_FG, gridcolor="#222222")
+    # showspikes=False: the crosshair is drawn by assets/crosshair.js as a
+    # DOM overlay (Plotly's own spike can only span the hovered panel, and
+    # it snaps to data, so leaving it on would double the vertical line a
+    # few pixels off the overlay's cursor-tracked one).
+    fig.update_xaxes(color=COLOR_FG, gridcolor="#222222", showspikes=False)
     if _view_mode == "panned" and _panned_end_ts is not None:
         fig.update_xaxes(range=[xs[0], xs[-1]])
 

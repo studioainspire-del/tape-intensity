@@ -21,7 +21,7 @@ The chart works because aggressor side is asymmetric even though volume is symme
 tape-intensity/
   adapters/            base.py, csv_adapter.py, replay_adapter.py, live_databento.py
   processor/           intensity.py
-  app/                 dashboard.py
+  app/                 dashboard.py, assets/crosshair.js
   config/              instruments.py
   sample_data/         CSV files for replay (gitignored except sample_nq.csv)
   main.py              unused initialization stub
@@ -219,6 +219,18 @@ Two panels stacked under the aggressor chart. They are rows of the *same* Plotly
 - **Shows gaps (and `rvol --` in the status bar) until history spans ≥2 minutes.** Not a bug — the baseline is warming up. Expect it after every processor start.
 - Computed dashboard-side from history samples of the raw cumulative volume counter; the figure fetch pulls `VISIBLE_WINDOW_SECONDS + RVOL_SLOW_SECONDS` of history so the panel's left edge still has a full lookback. The counter is never baselined — RVOL only takes differences, so offsets cancel.
 - Status bar shows live `cvd`, `Δcvd` (when anchored), and `rvol` — live values only, per the Phase 7b rule.
+
+## Crosshair overlay (`app/assets/crosshair.js`)
+
+A vertical line spanning **all** panels (continuous through the gaps) plus a horizontal line floating at the cursor's y inside the hovered panel. Anything in `app/assets/` is auto-served by Dash — no wiring needed beyond the file existing.
+
+It is a **DOM overlay, not Plotly spikes**, for two reasons: Plotly's x spike can only span the subplot it's drawn in (`hoversubplots: "axis"` does *not* draw spikes across rows — verified on plotly.js 3.7 including the documented minimal example), and the figure rebuilds up to 5x/sec, with every `Plotly.react` clearing hover state (gotcha #8) — a spike-based crosshair would flicker. The overlay is driven by mousemove only: zero server round-trips, immune to rebuilds.
+
+Rules if you touch it:
+- **`pointer-events: none` on both lines is load-bearing.** They sit over Plotly's drag layer; if they ever capture events, panning and chart clicks break.
+- z-index stays below the LIVE badge (10) so the badge remains clickable.
+- Plot bounds are read from the `.nsewdrag` rects (Plotly's per-panel drag layers) via `getBoundingClientRect`, re-read on every move — no `_fullLayout` internals, no stale geometry after a rebuild.
+- `showspikes=False` on the x-axes in `_build_figure` exists so Plotly's own snapped spike doesn't double the overlay's cursor-tracked line. Removing it brings back a fuzzy double line.
 
 ## What is NOT yet built (deliberate scope, not bugs)
 
