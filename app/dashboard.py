@@ -76,6 +76,17 @@ RVOL_FAST_SECONDS = 60.0          # numerator window ("this minute")
 RVOL_SLOW_SECONDS = 300.0         # baseline window ("last five minutes")
 RVOL_MIN_BASELINE_SECONDS = 120.0  # below this much history, show no RVOL
 
+# RVOL slope colouring. Direction is measured against the value this far
+# back, NOT against the previous sample: RVOL is a 60s rate over a 300s
+# rate, so two consecutive 5 Hz samples differ by noise and their sign
+# flips at random while RVOL is flat — sample-to-sample colouring would
+# strobe green/red exactly when nothing is happening. Moves smaller than
+# the deadband stay neutral for the same reason. Both are tuning knobs:
+# raise the lookback for a calmer read, raise the deadband to demand a
+# bigger move before committing to a direction.
+RVOL_SLOPE_LOOKBACK_SECONDS = 5.0
+RVOL_SLOPE_DEADBAND = 0.02
+
 # Live uirevision stability bucket. The live-mode uirevision advances
 # with the live edge quantized to this many seconds. It must change
 # often enough that the x-axis keeps scrolling and both y-axes keep
@@ -90,7 +101,11 @@ COLOR_SELL = "#ff5b5b"
 COLOR_PRICE = "#ffffff"
 COLOR_NET = "#ffcc00"
 COLOR_CVD = "#5ab4ff"
-COLOR_RVOL = "#c58cff"
+COLOR_RVOL = "#c58cff"        # neutral: RVOL flat within the deadband
+COLOR_RVOL_UP = "#00d68f"     # participation building
+COLOR_RVOL_DOWN = "#ff5b5b"   # participation bleeding off
+_RVOL_STATE_COLORS = {"up": COLOR_RVOL_UP, "down": COLOR_RVOL_DOWN,
+                      "flat": COLOR_RVOL}
 COLOR_BG = "#111111"
 COLOR_FG = "#cccccc"
 # Neutral-reference lines: zero on the intensity and CVD panels, 1.0x on
@@ -336,14 +351,89 @@ def _rvol_series(recent: list, ext: list) -> list[Optional[float]]:
     ]
 
 
-def _current_rvol() -> Optional[float]:
-    """Latest RVOL value, for the (always-live) status bar."""
+def _slope_state(delta: Optional[float]) -> str:
+    """Classify an RVOL change as 'up' / 'down' / 'flat'."""
+    if delta is None:
+        return "flat"
+    if delta > RVOL_SLOPE_DEADBAND:
+        return "up"
+    if delta < -RVOL_SLOPE_DEADBAND:
+        return "down"
+    return "flat"
+
+
+def _rvol_colored_series(
+    recent: list, ext: list
+) -> tuple[list[Optional[float]], list[Optional[float]], list[Optional[float]]]:
+    """Split the RVOL series into (rising, falling, flat) masks.
+
+    Plotly cannot colour segments within a single line trace, so the
+    panel draws three full-length traces that each carry None outside
+    their own stretches. A point where two stretches meet is present in
+    BOTH masks, so the line shows no hairline gap at the handoff.
+
+    Each segment takes the direction of its newer endpoint, measured
+    against the value RVOL_SLOPE_LOOKBACK_SECONDS earlier (see that
+    constant for why not the previous sample).
+    """
+    if not recent:
+        return [], [], []
+
+    # Extend left by the lookback so the leftmost visible points get a
+    # real direction instead of defaulting to neutral.
+    ctx_start = (recent[0].timestamp
+                 - timedelta(seconds=RVOL_SLOPE_LOOKBACK_SECONDS))
+    ctx = [s for s in ext if s.timestamp >= ctx_start]
+    if len(ctx) < len(recent):
+        ctx = recent
+    rvols = _rvol_series(ctx, ext)
+    ts = [s.timestamp.timestamp() for s in ctx]
+
+    states = []
+    for j in range(len(ctx)):
+        k = bisect.bisect_right(ts, ts[j] - RVOL_SLOPE_LOOKBACK_SECONDS) - 1
+        if k < 0 or rvols[j] is None or rvols[k] is None:
+            states.append("flat")
+        else:
+            states.append(_slope_state(rvols[j] - rvols[k]))
+
+    offset = len(ctx) - len(recent)
+    vis_rvols, vis_states = rvols[offset:], states[offset:]
+
+    n = len(vis_rvols)
+    masks: dict[str, list[Optional[float]]] = {
+        "up": [None] * n, "down": [None] * n, "flat": [None] * n,
+    }
+    if n == 1:
+        masks["flat"][0] = vis_rvols[0]
+    for i in range(n - 1):
+        if vis_rvols[i] is None or vis_rvols[i + 1] is None:
+            continue
+        mask = masks[vis_states[i + 1]]
+        mask[i] = vis_rvols[i]
+        mask[i + 1] = vis_rvols[i + 1]
+    return masks["up"], masks["down"], masks["flat"]
+
+
+def _current_rvol() -> tuple[Optional[float], str]:
+    """Latest RVOL value and its slope state, for the status bar.
+
+    Always live values, like the rest of the bar — never the panned
+    moment (Phase 7b rule).
+    """
     ext = processor.get_recent_history(RVOL_SLOW_SECONDS + 2.0)
     if not ext:
-        return None
+        return None, "flat"
     ts_list = [s.timestamp.timestamp() for s in ext]
     cum_list = [s.cum_volume for s in ext]
-    return _rvol_at(ts_list, cum_list, ts_list[-1], ext[-1].cum_volume)
+    now_t = ts_list[-1]
+    value = _rvol_at(ts_list, cum_list, now_t, ext[-1].cum_volume)
+    k = bisect.bisect_right(ts_list, now_t - RVOL_SLOPE_LOOKBACK_SECONDS) - 1
+    prev = (_rvol_at(ts_list, cum_list, ts_list[k], ext[k].cum_volume)
+            if k >= 0 else None)
+    if value is None or prev is None:
+        return value, "flat"
+    return value, _slope_state(value - prev)
 
 
 def _handle_relayout(relayout_data: Optional[dict]) -> bool:
@@ -683,10 +773,11 @@ def _update_chart(
     btn_style = _LIVE_BTN_VISIBLE if _view_mode == "panned" else _LIVE_BTN_HIDDEN
     anchor_style = (_CLEAR_BTN_VISIBLE if _cvd_anchor_ts is not None
                     else _CLEAR_BTN_HIDDEN)
-    rvol_now = _current_rvol()
+    rvol_now, rvol_state = _current_rvol()
 
     if not rebuild:
-        return (no_update, _build_status(state, staleness_seconds, rvol_now),
+        return (no_update,
+                _build_status(state, staleness_seconds, rvol_now, rvol_state),
                 btn_style, anchor_style)
 
     # Select the visible slice plus the RVOL lookback in one fetch.
@@ -711,7 +802,7 @@ def _update_chart(
     _last_build_toggles = frozenset(toggles)
     if _view_mode == "live":
         _last_live_build_ts = state.timestamp
-    return (fig, _build_status(state, staleness_seconds, rvol_now),
+    return (fig, _build_status(state, staleness_seconds, rvol_now, rvol_state),
             btn_style, anchor_style)
 
 def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
@@ -858,14 +949,21 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
     # RVOL panel: unitless multiple with a 1.0x reference line. Gaps
     # (None) mean the baseline window is still too short.
     if show_rvol:
-        rvols = _rvol_series(recent, ext)
-        fig.add_trace(
-            go.Scatter(x=xs, y=rvols, name="RVOL",
-                       line=dict(color=COLOR_RVOL, width=1.5),
-                       connectgaps=False,
-                       hovertemplate="%{y:.2f}x<extra>rvol</extra>"),
-            row=rvol_row, col=1,
-        )
+        # Three traces, not one — Plotly can't colour segments inside a
+        # single trace (see _rvol_colored_series). Only the neutral one
+        # carries the legend entry, so RVOL still appears once.
+        up, down, flat = _rvol_colored_series(recent, ext)
+        for series, color, show_leg in ((flat, COLOR_RVOL, True),
+                                        (up, COLOR_RVOL_UP, False),
+                                        (down, COLOR_RVOL_DOWN, False)):
+            fig.add_trace(
+                go.Scatter(x=xs, y=series, name="RVOL",
+                           legendgroup="rvol", showlegend=show_leg,
+                           line=dict(color=color, width=1.5),
+                           connectgaps=False,
+                           hovertemplate="%{y:.2f}x<extra>rvol</extra>"),
+                row=rvol_row, col=1,
+            )
         # RVOL's neutral reference is 1.0x, not 0 — a ratio's "zero".
         # (0 sits on the axis floor under rangemode="tozero".) White to
         # match the other panels' reference lines; kept dotted so it
@@ -938,7 +1036,8 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
 
 
 def _build_status(state, staleness_seconds: float,
-                  rvol_now: Optional[float]) -> html.Div:
+                  rvol_now: Optional[float],
+                  rvol_state: str = "flat") -> html.Div:
     """Build the status bar. Always live values — never offset-aware."""
     health_color, health_label = _health_from_age(staleness_seconds)
     last_tick_str = state.timestamp.astimezone(display_tz).strftime("%H:%M:%S")
@@ -972,7 +1071,9 @@ def _build_status(state, staleness_seconds: float,
     children.append(
         html.Span(f"rvol {rvol_now:.2f}x" if rvol_now is not None
                   else "rvol --",
-                  style={"color": COLOR_RVOL}))
+                  # Same colour as the panel line, so the direction
+                  # reads without looking at the chart.
+                  style={"color": _RVOL_STATE_COLORS[rvol_state]}))
     children.append(
         html.Span(f"buf {state.tick_count_in_window}",
                   style={"color": "#888888"}))
