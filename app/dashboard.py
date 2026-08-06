@@ -93,6 +93,10 @@ COLOR_CVD = "#5ab4ff"
 COLOR_RVOL = "#c58cff"
 COLOR_BG = "#111111"
 COLOR_FG = "#cccccc"
+# Neutral-reference lines: zero on the intensity and CVD panels, 1.0x on
+# RVOL (a ratio's "zero"). White so the sign flip reads at a glance —
+# these are the lines the eye checks against, so they outrank gridlines.
+COLOR_ZEROLINE = "#ffffff"
 
 # LIVE badge styling (Phase 7b): subtle corner-mounted button, only
 # visible while panned back. Absolute positioning relies on the graph's
@@ -804,12 +808,14 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
         fig.update_yaxes(secondary_y=True, row=1, col=1,
                          color=COLOR_FG, title_text="contracts/sec",
                          gridcolor="#222222", showgrid=True,
-                         zeroline=True, zerolinecolor="#444444",
+                         zeroline=True, zerolinecolor=COLOR_ZEROLINE,
                          zerolinewidth=1)
     else:
         fig.update_yaxes(rangemode="tozero", secondary_y=True, row=1, col=1,
                          color=COLOR_FG, title_text="contracts/sec",
-                         gridcolor="#222222", showgrid=True)
+                         gridcolor="#222222", showgrid=True,
+                         zeroline=True, zerolinecolor=COLOR_ZEROLINE,
+                         zerolinewidth=1)
 
     # Left axis (price, context only). Visible only when price toggle
     # is on. No gridlines — price gridlines would clutter the focus on
@@ -841,7 +847,7 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
         fig.update_yaxes(row=cvd_row, col=1, color=COLOR_CVD,
                          title_text="cvd", gridcolor="#222222",
                          showgrid=True, zeroline=True,
-                         zerolinecolor="#444444", zerolinewidth=1)
+                         zerolinecolor=COLOR_ZEROLINE, zerolinewidth=1)
         if _cvd_anchor_ts is not None and xs:
             anchor_local = _cvd_anchor_ts.astimezone(display_tz)
             if xs[0] <= anchor_local <= xs[-1]:
@@ -860,8 +866,12 @@ def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
                        hovertemplate="%{y:.2f}x<extra>rvol</extra>"),
             row=rvol_row, col=1,
         )
+        # RVOL's neutral reference is 1.0x, not 0 — a ratio's "zero".
+        # (0 sits on the axis floor under rangemode="tozero".) White to
+        # match the other panels' reference lines; kept dotted so it
+        # still reads as a ratio marker rather than a hard zero.
         fig.add_hline(y=1.0, row=rvol_row, col=1, line_width=1,
-                      line_dash="dot", line_color="#555555")
+                      line_dash="dot", line_color=COLOR_ZEROLINE)
         fig.update_yaxes(row=rvol_row, col=1, color=COLOR_RVOL,
                          title_text="rvol", gridcolor="#222222",
                          showgrid=True, rangemode="tozero")
