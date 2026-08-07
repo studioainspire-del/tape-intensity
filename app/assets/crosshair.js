@@ -33,6 +33,14 @@
     var H_ID = "crosshair-h";
     var COLOR = "rgba(204, 204, 204, 0.55)";
 
+    // Gap between the cursor and the right edge of the hover box.
+    var HOVER_GAP = 12;
+
+    // Cursor position, recorded in the capture phase so it is current
+    // when Plotly's own mousemove handler redraws the hover box.
+    var lastX = null;
+    var lastY = null;
+
     function styleLine(el, vertical) {
         el.style.position = "absolute";
         el.style.pointerEvents = "none";
@@ -74,11 +82,80 @@
         });
     }
 
+    /*
+     * Move the unified hover box to the LEFT of the cursor.
+     *
+     * Plotly has no layout attribute for this — layout.hoverlabel only
+     * exposes align/bgcolor/bordercolor/font/namelength/showarrow — so
+     * the box is nudged in the DOM. Plotly renders the "x unified" box
+     * as <g class="legend"> inside .hoverlayer, placing it ~5px right of
+     * the cursor, except near the right edge where it already flips
+     * left. Because the live edge IS the right edge, a blind shift would
+     * double up exactly where the cursor spends most of its time, so we
+     * measure Plotly's actual placement each time and set an absolute
+     * offset from it.
+     *
+     * Clearing our own transform before measuring is what keeps this
+     * from compounding: every pass starts from Plotly's own position.
+     */
+    function placeHoverLeft(wrap) {
+        var box = wrap.querySelector(".hoverlayer g.legend");
+        if (!box || lastX === null) {
+            return;
+        }
+        // A CSS transform REPLACES the SVG transform attribute rather
+        // than composing with it, so Plotly's own translate has to be
+        // read and carried, not just offset from.
+        var attr = box.getAttribute("transform") || "";
+        var m = /translate\(\s*(-?[\d.]+)[\s,]+(-?[\d.]+)/.exec(attr);
+        if (!m) {
+            return;
+        }
+        var baseX = parseFloat(m[1]);
+        var baseY = parseFloat(m[2]);
+
+        // Measure with our offset cleared, so every pass starts from
+        // Plotly's own placement and the shift can't compound.
+        box.style.transform = "";
+        var r = box.getBoundingClientRect();
+        if (!r.width) {
+            return;
+        }
+        var dx = (lastX - HOVER_GAP) - r.right;
+        // Near the left edge there is no room; keep Plotly's placement
+        // rather than pushing the box off the chart.
+        if (dx < 0 && r.left + dx > wrap.getBoundingClientRect().left) {
+            box.style.transform =
+                "translate(" + (baseX + dx) + "px," + baseY + "px)";
+        }
+    }
+
     function attach(wrap) {
         if (wrap.dataset.crosshairOn === "1") {
             return;
         }
         wrap.dataset.crosshairOn = "1";
+
+        // Capture phase: runs before Plotly's own handler, so lastX is
+        // current by the time Plotly redraws the hover box.
+        wrap.addEventListener("mousemove", function (ev) {
+            lastX = ev.clientX;
+            lastY = ev.clientY;
+        }, true);
+
+        // Reposition as soon as Plotly draws or moves the hover box.
+        // MutationObserver callbacks run before paint, so the box never
+        // appears at Plotly's position first — no flicker. We watch the
+        // transform ATTRIBUTE (Plotly's) and write to style (ours), so
+        // our own writes can't retrigger the observer.
+        new MutationObserver(function () {
+            placeHoverLeft(wrap);
+        }).observe(wrap, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["transform"],
+        });
 
         wrap.addEventListener("mousemove", function (ev) {
             var drags = wrap.querySelectorAll(".nsewdrag");

@@ -230,6 +230,11 @@ A vertical line spanning **all** panels (continuous through the gaps) plus a hor
 
 It is a **DOM overlay, not Plotly spikes**, for two reasons: Plotly's x spike can only span the subplot it's drawn in (`hoversubplots: "axis"` does *not* draw spikes across rows — verified on plotly.js 3.7 including the documented minimal example), and the figure rebuilds up to 5x/sec, with every `Plotly.react` clearing hover state (gotcha #8) — a spike-based crosshair would flicker. The overlay is driven by mousemove only: zero server round-trips, immune to rebuilds.
 
+The same file also **moves the unified hover box to the left of the cursor**. Plotly has no attribute for this (`layout.hoverlabel` exposes only align/bgcolor/bordercolor/font/namelength/showarrow), so the box — rendered as `<g class="legend">` inside `.hoverlayer` — is nudged in the DOM. Three things make that work and are easy to break:
+- Plotly places the box ~5px *right* of the cursor everywhere **except** near the right edge, where it already flips left. Since the live edge is the right edge, that's where the cursor spends most of its time, so a blind shift would double up exactly there. The code measures Plotly's actual placement each time and sets an absolute offset from it.
+- A CSS `transform` **replaces** the SVG `transform` attribute rather than composing with it, so Plotly's own translate is parsed out of the attribute and carried into the CSS value. Offsetting without carrying it throws the box across the chart.
+- Repositioning happens in a `MutationObserver` watching the transform *attribute* while writing to *style*, so our own writes can't retrigger it, and the callback runs before paint (no flicker). Our offset is cleared before each measurement so the shift can't compound.
+
 Rules if you touch it:
 - **`pointer-events: none` on both lines is load-bearing.** They sit over Plotly's drag layer; if they ever capture events, panning and chart clicks break.
 - z-index stays below the LIVE badge (10) so the badge remains clickable.
