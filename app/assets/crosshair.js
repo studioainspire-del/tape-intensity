@@ -130,6 +130,35 @@
         }
     }
 
+    /*
+     * Reposition on the next animation frame.
+     *
+     * rAF runs after Plotly's own mousemove handler has drawn the hover
+     * box but before paint, so the box never appears on the wrong side
+     * first — no flicker — and the work only happens when the pointer
+     * actually moves.
+     *
+     * This deliberately does NOT use a MutationObserver over the chart:
+     * the figure is rebuilt up to 5x/sec, so an observer would fire on
+     * every rebuild and force a synchronous layout of the whole
+     * (900-point, 8-trace) SVG each time. Measured at ~3.4x the layout
+     * and style-recalc count for no benefit — a rebuild CLEARS hover
+     * state (gotcha #8) rather than redrawing the box, so there is
+     * nothing to correct until the pointer moves again.
+     */
+    var framePending = false;
+
+    function scheduleHoverPlacement(wrap) {
+        if (framePending) {
+            return;
+        }
+        framePending = true;
+        requestAnimationFrame(function () {
+            framePending = false;
+            placeHoverLeft(wrap);
+        });
+    }
+
     function attach(wrap) {
         if (wrap.dataset.crosshairOn === "1") {
             return;
@@ -142,20 +171,6 @@
             lastX = ev.clientX;
             lastY = ev.clientY;
         }, true);
-
-        // Reposition as soon as Plotly draws or moves the hover box.
-        // MutationObserver callbacks run before paint, so the box never
-        // appears at Plotly's position first — no flicker. We watch the
-        // transform ATTRIBUTE (Plotly's) and write to style (ours), so
-        // our own writes can't retrigger the observer.
-        new MutationObserver(function () {
-            placeHoverLeft(wrap);
-        }).observe(wrap, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ["transform"],
-        });
 
         wrap.addEventListener("mousemove", function (ev) {
             var drags = wrap.querySelectorAll(".nsewdrag");
@@ -210,6 +225,8 @@
             } else {
                 h.style.display = "none";
             }
+
+            scheduleHoverPlacement(wrap);
         });
 
         wrap.addEventListener("mouseleave", hideLines);
