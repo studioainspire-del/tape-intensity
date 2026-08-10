@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import bisect
+import gzip
 import logging
 import os
 import threading
@@ -41,6 +42,7 @@ from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
 from dash import Dash, ctx, dcc, html, no_update, Input, Output, callback
+from flask import request
 from plotly.subplots import make_subplots
 
 from adapters.csv_adapter import CSVAdapter
@@ -575,7 +577,50 @@ def run_data_pipeline(
 # Dash app — layout built once, after main() configures globals
 # ---------------------------------------------------------------------------
 
+# Response compression. Level 6 gzips a full-window figure ~12x for
+# under 2 ms of CPU (well under 1% of a core at 5 Hz).
+GZIP_LEVEL = 6
+GZIP_MIN_BYTES = 1024
+
 app = Dash(__name__, update_title=None)
+
+
+@app.server.after_request
+def _compress_response(response):
+    """gzip responses before they go on the wire.
+
+    A full 3-minute window is ~280 KB of JSON per refresh (8 traces of
+    ~900 samples, with the timestamp array repeated in every trace), and
+    Dash does not issue the next request until the current one lands —
+    so on a remote link the effective refresh rate is 1/round-trip, not
+    5 Hz. Over a tunnel that reads as a chart which only catches up
+    every few seconds while the status bar, riding the very same
+    response, still looks live. That payload is highly repetitive and
+    gzips ~12x, i.e. ~11 Mbps sustained down to under 1.
+
+    Flask sends responses uncompressed by default, and Dash only
+    compresses when flask-compress is installed (it is not a dependency
+    here), so it is done explicitly.
+    """
+    if response.direct_passthrough or "Content-Encoding" in response.headers:
+        return response
+    if not 200 <= response.status_code < 300:
+        return response
+    if "gzip" not in request.headers.get("Accept-Encoding", "").lower():
+        return response
+    ctype = response.headers.get("Content-Type", "")
+    if not (ctype.startswith("application/json")
+            or ctype.startswith("text/")
+            or "javascript" in ctype):
+        return response
+    data = response.get_data()
+    if len(data) < GZIP_MIN_BYTES:
+        return response
+    response.set_data(gzip.compress(data, GZIP_LEVEL))
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(response.get_data()))
+    response.headers.add("Vary", "Accept-Encoding")
+    return response
 
 
 def _build_layout() -> html.Div:

@@ -109,6 +109,16 @@ If always red:
 - During replay, ticks arrive at replay speed; staleness threshold is 1s (green) / 5s (yellow). Replays at speed < 1.0x or quiet midday CSV sections may legitimately show yellow.
 - During live, quiet markets can produce 1-3 second gaps between trades. Yellow flicker during midday lulls is normal. Persistent red means the connection died.
 
+### Symptom: chart only catches up every few seconds when viewed remotely (tunnel / phone / another machine), while the status bar looks live
+
+Throughput, not a state-machine bug. **Dash does not start the next request for a callback until the current one lands**, so the effective refresh rate is 1/round-trip, not 5 Hz. The figure and the status bar ride the *same* response, but the status bar is a few hundred bytes of HTML while the figure is the whole payload — so a slow link looks like "numbers live, chart frozen, jumps to current every few seconds".
+
+A full 3-minute window is **~260 KB of JSON per refresh** (8 traces × ~900 samples, and the timestamp array is repeated in every trace). At 5 Hz that is ~10 Mbps sustained, which a tunnel will not carry. Responses are gzipped in `_compress_response` (`app/dashboard.py`), which takes it to ~25 KB (~10x) for under 2 ms of CPU. Flask does not compress by default and Dash only does when flask-compress is installed, which it isn't — so if remote viewing degrades again, check that hook still fires (`Content-Encoding: gzip` on `_dash-update-component` in devtools).
+
+Second factor worth knowing: the callback is lock-serialized (`_callback_lock`) and one figure build costs ~100 ms, so **every extra open browser tab divides the refresh rate**. Viewing on the host PC while also viewing over a tunnel roughly halves both. Close the host browser when watching remotely.
+
+The distinguishing check against the scrollback freeze: if the LIVE badge is **not** showing and the status bar is updating, the server is live and sending figures — the problem is the link, not `_view_mode`.
+
 ### Symptom: browser tab title flickers "Updating..." every 200ms
 
 Fixed by `update_title=None` in the `Dash(...)` constructor. If it returns, that arg was removed.
