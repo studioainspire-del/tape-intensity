@@ -41,7 +41,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
-from dash import Dash, ctx, dcc, html, no_update, Input, Output, callback
+from dash import (Dash, ctx, dcc, html, no_update, Input, Output, State,
+                  callback)
 from flask import request
 from plotly.subplots import make_subplots
 
@@ -206,12 +207,9 @@ def _set_live() -> None:
 _cvd_anchor_ts: Optional[datetime] = None
 _cvd_anchor_value: Optional[int] = None
 
-# Last tick timestamp the live figure was built from. Lets tick
-# refreshes skip rebuilding when no new tick arrived: the figure would
-# be pixel-identical, and each needless Plotly.react clears the
-# browser's hover state, which makes anchor clicks unreliable during
-# quiet stretches.
-_last_live_build_ts: Optional[datetime] = None
+# Marks a client's stored render as "a frozen (panned) slice" rather
+# than a tick timestamp — see the render-state Store in the layout.
+_PANNED_SENTINEL = "panned"
 
 # Last-seen n_clicks per button. Button presses are detected by VALUE
 # CHANGE, not by ctx trigger attribution: with the 5 Hz interval, a
@@ -223,11 +221,11 @@ _last_live_build_ts: Optional[datetime] = None
 # (n_clicks reset); re-sync without treating it as a press.
 _btn_seen = {"live": 0, "drop": 0, "clear": 0}
 
-# Toggle set the current figure was built with. Same coalescing story
+# NOTE: the toggle set the figure was built with is also tracked
+# per-client in the render-state Store, for the same coalescing reason
 # as _btn_seen: a checklist change folded into a tick request arrives
-# attributed to "tick", so the tick-skip branches must compare values,
-# not trust the trigger, or a coalesced toggle change never renders.
-_last_build_toggles: Optional[frozenset] = None
+# attributed to "tick", so the tick-skip branches compare values rather
+# than trusting the trigger, or a coalesced toggle change never renders.
 
 # Last-seen relayoutData / clickData, for the same value-diff reason as
 # _btn_seen: every request carries the current values of all Inputs, so
@@ -705,6 +703,13 @@ def _build_layout() -> html.Div:
                     ),
                 ],
             ),
+            # Per-browser record of what this client last had rendered.
+            # The rebuild guard has to be per-client: "have I already
+            # been sent this figure?" is a question about one browser,
+            # not about the server. Held here rather than in a module
+            # global so a second viewer (e.g. a tunnel) cannot be
+            # starved of figures by the first one consuming each tick.
+            dcc.Store(id="render-state", storage_type="memory"),
             dcc.Interval(id="tick", interval=POLL_INTERVAL_MS, n_intervals=0),
         ],
     )
@@ -723,6 +728,7 @@ def _health_from_age(age_seconds: float) -> tuple[str, str]:
     Output("status-bar", "children"),
     Output("live-button", "style"),
     Output("clear-anchor-button", "style"),
+    Output("render-state", "data"),
     Input("tick", "n_intervals"),
     Input("line-toggles", "value"),
     Input("intensity-chart", "relayoutData"),
@@ -730,6 +736,7 @@ def _health_from_age(age_seconds: float) -> tuple[str, str]:
     Input("live-button", "n_clicks"),
     Input("drop-anchor-button", "n_clicks"),
     Input("clear-anchor-button", "n_clicks"),
+    State("render-state", "data"),
 )
 def update_chart(*args):
     # Serialize concurrent requests — see _callback_lock.
@@ -745,11 +752,15 @@ def _update_chart(
     _live_clicks: int,
     _drop_clicks: int,
     _clear_clicks: int,
+    render_state: Optional[dict],
 ):
-    global _last_seen_tick_ts, _last_seen_wall, _last_live_build_ts, \
-        _last_build_toggles
+    global _last_seen_tick_ts, _last_seen_wall
 
     toggles = toggles or []
+    # What THIS browser last had rendered (see the render-state Store).
+    render_state = render_state or {}
+    client_built_ts = render_state.get("ts")
+    toggles_unchanged = render_state.get("toggles") == sorted(toggles)
 
     # Live state for the status bar. Always live values, even while
     # panned back — deliberate: pattern from the chart, numbers from
@@ -799,20 +810,24 @@ def _update_chart(
         # Click drops (or moves) the CVD anchor.
         rebuild = _handle_click(click_data)
     elif (prop == "tick.n_intervals"
-          and frozenset(toggles) == _last_build_toggles
-          and _view_mode == "panned"):
+          and toggles_unchanged
+          and _view_mode == "panned"
+          and client_built_ts == _PANNED_SENTINEL):
         # Interval tick while panned: the slice is frozen. Skip the
         # figure (no_update) but let the status bar refresh below —
         # this is why the interval stays enabled in panned mode.
         # (A changed toggle set falls through and rebuilds.)
         rebuild = False
     elif (prop == "tick.n_intervals"
-          and frozenset(toggles) == _last_build_toggles
-          and state.timestamp == _last_live_build_ts):
-        # Live tick with no new data since the last build: the figure
-        # would be identical. Skipping the rebuild also stops needless
-        # Plotly.react churn from clearing hover state (see
-        # _last_live_build_ts).
+          and toggles_unchanged
+          and _view_mode == "live"
+          and client_built_ts == state.timestamp.isoformat()):
+        # Live tick with no new data since THIS CLIENT's last build: the
+        # figure it already has is identical. Skipping also stops
+        # needless Plotly.react churn from clearing hover state (gotcha
+        # #8). Compared per-client, never against a module global — a
+        # global lets whichever browser polls first consume each tick
+        # and starve every other viewer of figures entirely.
         rebuild = False
 
     btn_style = _LIVE_BTN_VISIBLE if _view_mode == "panned" else _LIVE_BTN_HIDDEN
@@ -823,7 +838,7 @@ def _update_chart(
     if not rebuild:
         return (no_update,
                 _build_status(state, staleness_seconds, rvol_now, rvol_state),
-                btn_style, anchor_style)
+                btn_style, anchor_style, no_update)
 
     # Select the visible slice plus the RVOL lookback in one fetch.
     # Live: trailing window off the newest snapshot (Phase 7a). Panned:
@@ -841,14 +856,22 @@ def _update_chart(
                         - timedelta(seconds=VISIBLE_WINDOW_SECONDS)) if ext else None
     recent = [s for s in ext if s.timestamp >= window_start]
     if not recent:
-        return _empty_figure(), "no data", _LIVE_BTN_HIDDEN, anchor_style
+        return (_empty_figure(), "no data", _LIVE_BTN_HIDDEN, anchor_style,
+                no_update)
 
     fig = _build_figure(recent, ext, toggles)
-    _last_build_toggles = frozenset(toggles)
-    if _view_mode == "live":
-        _last_live_build_ts = state.timestamp
+    # Record what this client now has. Panned slices are frozen by an
+    # absolute window rather than a tick, so they carry a sentinel; any
+    # new pan changes _panned_end_ts, which reaches the client through
+    # the rebuild it triggers.
+    new_render_state = {
+        "ts": (_PANNED_SENTINEL if _view_mode == "panned"
+               else state.timestamp.isoformat()),
+        "toggles": sorted(toggles),
+    }
     return (fig, _build_status(state, staleness_seconds, rvol_now, rvol_state),
-            btn_style, anchor_style)
+            btn_style, anchor_style, new_render_state)
+
 
 def _build_figure(recent: list, ext: list, toggles: list[str]) -> go.Figure:
     """Build the stacked-panel figure for the visible slice.
